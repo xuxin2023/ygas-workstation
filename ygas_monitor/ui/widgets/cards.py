@@ -8,7 +8,14 @@ from PySide6.QtWidgets import QFrame, QGridLayout, QLabel, QSizePolicy, QVBoxLay
 
 
 class MetricCard(QFrame):
-    def __init__(self, title: str = "", parent: QWidget | None = None):
+    def __init__(
+        self,
+        title: str = "",
+        *,
+        compact: bool = False,
+        dense: bool = False,
+        parent: QWidget | None = None,
+    ):
         super().__init__(parent)
         self.setObjectName("MetricCard")
         self.setFrameShape(QFrame.StyledPanel)
@@ -17,20 +24,33 @@ class MetricCard(QFrame):
         )
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._last_numeric_value: float | None = None
+        self._density = "dense" if dense else ("compact" if compact else "regular")
+        self._last_style_key: tuple[str, str] | None = None
+        self._last_text_key: tuple[str, str, str, str] | None = None
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(6)
+        if self._density == "dense":
+            layout.setContentsMargins(8, 7, 8, 7)
+            layout.setSpacing(3)
+        elif self._density == "compact":
+            layout.setContentsMargins(10, 9, 10, 9)
+            layout.setSpacing(4)
+        else:
+            layout.setContentsMargins(14, 12, 14, 12)
+            layout.setSpacing(6)
 
         self.title_label = QLabel(title)
         self.title_label.setProperty("muted", True)
         self.value_label = QLabel("--")
-        self.value_label.setStyleSheet("font-size: 30px; font-weight: 700; color: #f7fbff;")
+        self.value_label.setStyleSheet(self._value_style("#f7fbff"))
         self.unit_label = QLabel("")
         self.unit_label.setProperty("muted", True)
         self.detail_label = QLabel("")
         self.detail_label.setProperty("muted", True)
         self.detail_label.setWordWrap(True)
+        self.title_label.setStyleSheet(self._title_style())
+        self.unit_label.setStyleSheet(self._meta_style())
+        self.detail_label.setStyleSheet(self._detail_style())
 
         layout.addWidget(self.title_label)
         layout.addWidget(self.value_label)
@@ -46,11 +66,6 @@ class MetricCard(QFrame):
         detail: str = "",
         severity: str = "normal",
     ) -> None:
-        self.title_label.setText(title)
-        self.value_label.setText(value)
-        self.unit_label.setText(unit)
-        self.detail_label.setText(detail)
-
         current_numeric = self._to_float(value)
         highlight = "normal"
         if current_numeric is not None and self._last_numeric_value is not None:
@@ -70,10 +85,25 @@ class MetricCard(QFrame):
             border = "#2f79b8"
             value_color = "#9fd3ff"
 
-        self.setStyleSheet(
-            f"QFrame#MetricCard {{ background: #1a222a; border: 1px solid {border}; border-radius: 12px; }}"
-        )
-        self.value_label.setStyleSheet(f"font-size: 30px; font-weight: 700; color: {value_color};")
+        text_key = (title, value, unit, detail)
+        if text_key != self._last_text_key:
+            self._last_text_key = text_key
+            if self.title_label.text() != title:
+                self.title_label.setText(title)
+            if self.value_label.text() != value:
+                self.value_label.setText(value)
+            if self.unit_label.text() != unit:
+                self.unit_label.setText(unit)
+            if self.detail_label.text() != detail:
+                self.detail_label.setText(detail)
+
+        style_key = (border, value_color)
+        if style_key != self._last_style_key:
+            self._last_style_key = style_key
+            self.setStyleSheet(
+                f"QFrame#MetricCard {{ background: #1a222a; border: 1px solid {border}; border-radius: 12px; }}"
+            )
+            self.value_label.setStyleSheet(self._value_style(value_color))
 
     @staticmethod
     def _to_float(value: str) -> float | None:
@@ -82,17 +112,46 @@ class MetricCard(QFrame):
         except Exception:
             return None
 
+    def _value_style(self, color: str) -> str:
+        if self._density == "dense":
+            font_size = 18
+        elif self._density == "compact":
+            font_size = 22
+        else:
+            font_size = 30
+        return f"font-size: {font_size}px; font-weight: 700; color: {color};"
+
+    def _title_style(self) -> str:
+        font_size = 11 if self._density == "dense" else 12
+        return f"font-size: {font_size}px;"
+
+    def _meta_style(self) -> str:
+        font_size = 10 if self._density == "dense" else 11
+        return f"font-size: {font_size}px;"
+
+    def _detail_style(self) -> str:
+        font_size = 10 if self._density == "dense" else 11
+        return f"font-size: {font_size}px; line-height: 1.2;"
+
 
 class MetricCardGrid(QWidget):
-    def __init__(self, rows: int = 2, columns: int = 4, parent: QWidget | None = None):
+    def __init__(
+        self,
+        rows: int = 2,
+        columns: int = 4,
+        *,
+        compact: bool = False,
+        dense: bool = False,
+        parent: QWidget | None = None,
+    ):
         super().__init__(parent)
         self._cards: list[MetricCard] = []
         layout = QGridLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(6 if dense else 10)
 
         for index in range(rows * columns):
-            card = MetricCard()
+            card = MetricCard(compact=compact, dense=dense)
             row = index // columns
             column = index % columns
             layout.addWidget(card, row, column)

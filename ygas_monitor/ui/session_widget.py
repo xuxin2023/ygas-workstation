@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+import math
 import time
 
 from PySide6.QtCore import QTimer, Qt, QUrl, Slot
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QProgressBar,
+    QScrollArea,
     QSlider,
     QSplitter,
     QTabWidget,
@@ -124,6 +126,8 @@ class SessionWidget(QWidget):
         self._abnormal_frame_times: deque[float] = deque()
         self._cmd_success_times: deque[float] = deque()
         self._cmd_fail_times: deque[float] = deque()
+        self._diagnostic_snapshot_dirty = False
+        self._expert_terminal_pending: list[str] = []
 
         self.replay_dataset: ReplayDataset | None = None
         self.replay_index = 0
@@ -142,6 +146,16 @@ class SessionWidget(QWidget):
         self.reconnect_timer.setSingleShot(True)
         self.reconnect_timer.timeout.connect(self._auto_reconnect_tick)
 
+        self.diagnostic_snapshot_timer = QTimer(self)
+        self.diagnostic_snapshot_timer.setInterval(300)
+        self.diagnostic_snapshot_timer.setSingleShot(True)
+        self.diagnostic_snapshot_timer.timeout.connect(self._flush_diagnostic_snapshot)
+
+        self.expert_terminal_timer = QTimer(self)
+        self.expert_terminal_timer.setInterval(120)
+        self.expert_terminal_timer.setSingleShot(True)
+        self.expert_terminal_timer.timeout.connect(self._flush_terminal_buffer)
+
         self._build_ui()
         self._connect_signals()
         self._refresh_ports(force=True)
@@ -150,7 +164,7 @@ class SessionWidget(QWidget):
         self._apply_permission_mode()
         self._update_target_badge()
         self._update_status_strip()
-        self._refresh_diagnostic_snapshot()
+        self._schedule_diagnostic_snapshot_refresh()
         self._update_anomaly_summary()
         self._update_safe_history_combo()
         self.age_timer.start()
@@ -159,6 +173,8 @@ class SessionWidget(QWidget):
         self.reconnect_timer.stop()
         self.replay_timer.stop()
         self.age_timer.stop()
+        self.diagnostic_snapshot_timer.stop()
+        self.expert_terminal_timer.stop()
         self.controller.shutdown()
 
     def collect_persisted_state(self) -> dict:
@@ -200,26 +216,17 @@ class SessionWidget(QWidget):
         layout.addWidget(self.broadcast_banner)
 
         layout.addWidget(self._build_status_strip())
-        layout.addWidget(self._build_quick_connect_box())
-
-        header_splitter = QSplitter(Qt.Horizontal)
-        header_splitter.addWidget(self._build_connection_box())
-        header_splitter.addWidget(self._build_workspace_box())
-        header_splitter.addWidget(self._build_diagnostic_box())
-        header_splitter.setStretchFactor(0, 4)
-        header_splitter.setStretchFactor(1, 3)
-        header_splitter.setStretchFactor(2, 4)
-        layout.addWidget(header_splitter)
 
         self.pages = QTabWidget()
-        self.pages.addTab(self._build_monitor_page(), "实时监测")
-        self.pages.addTab(self._build_control_page(), "设备控制")
-        self.pages.addTab(self._build_coeff_page(), "系数中心")
-        self.pages.addTab(self._build_signal_page(), "信号与滤波")
+        self.monitor_tab_index = self.pages.addTab(self._build_monitor_page(), "监测总览")
+        self.settings_tab_index = self.pages.addTab(self._build_settings_page(), "连接与设置")
+        self.control_tab_index = self.pages.addTab(self._build_control_page(), "设备控制")
+        self.coeff_tab_index = self.pages.addTab(self._build_coeff_page(), "系数中心")
+        self.signal_tab_index = self.pages.addTab(self._build_signal_page(), "信号与滤波")
         self.expert_page = self._build_expert_page()
-        self.pages.addTab(self.expert_page, "专家终端")
+        self.expert_tab_index = self.pages.addTab(self.expert_page, "专家终端")
         self.export_page = self._build_export_page()
-        self.pages.addTab(self.export_page, "数据导出与回放")
+        self.export_tab_index = self.pages.addTab(self.export_page, "数据导出与回放")
         layout.addWidget(self.pages, 1)
 
     def _build_status_strip(self) -> QWidget:
@@ -419,51 +426,113 @@ class SessionWidget(QWidget):
         layout.addWidget(self.command_history_combo, 13, 1)
         return box
 
+    def _build_settings_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        intro = QLabel("连接、串口、权限、联调和诊断信息已迁移到本页，监测总览首屏只保留盯数和看图。")
+        intro.setWordWrap(True)
+        intro.setProperty("muted", True)
+        layout.addWidget(intro)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(10)
+        content_layout.addWidget(self._build_quick_connect_box())
+
+        settings_splitter = QSplitter(Qt.Horizontal)
+        settings_splitter.setChildrenCollapsible(False)
+        settings_splitter.addWidget(self._build_connection_box())
+        settings_splitter.addWidget(self._build_workspace_box())
+        settings_splitter.addWidget(self._build_diagnostic_box())
+        settings_splitter.setSizes([480, 420, 520])
+        content_layout.addWidget(settings_splitter, 1)
+
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+        return page
+
     def _build_monitor_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
 
         controls = QHBoxLayout()
         self.freeze_button = QPushButton("监测冻结")
         self.freeze_button.setCheckable(True)
         controls.addWidget(self.freeze_button)
+        self.monitor_hint_label = QLabel("主监控区已抬升原始比值、滤波比值与滤波差值；连接设置已迁移到独立页面。")
+        self.monitor_hint_label.setProperty("muted", True)
+        controls.addWidget(self.monitor_hint_label)
         controls.addStretch(1)
         layout.addLayout(controls)
 
-        self.data_cards = MetricCardGrid(rows=3, columns=4)
-        self.monitor_cards = MetricCardGrid(rows=2, columns=4)
+        self.data_cards = MetricCardGrid(rows=2, columns=6, dense=True)
+        self.data_cards.setMinimumHeight(184)
+        self.data_cards.setMaximumHeight(226)
+        self.detail_cards = MetricCardGrid(rows=2, columns=4, compact=True)
+        self.monitor_cards = MetricCardGrid(rows=2, columns=4, compact=True)
 
-        anomaly_box = QGroupBox("最近异常摘要")
+        anomaly_box = QGroupBox("异常摘要")
         anomaly_layout = QFormLayout(anomaly_box)
         self.last_status_label = QLabel("--")
         self.last_command_fail_label = QLabel("--")
         self.last_serial_error_label = QLabel("--")
         self.last_broadcast_label = QLabel("--")
-        anomaly_layout.addRow("最近一次状态异常", self.last_status_label)
-        anomaly_layout.addRow("最近一次命令失败", self.last_command_fail_label)
-        anomaly_layout.addRow("最近一次串口异常", self.last_serial_error_label)
-        anomaly_layout.addRow("最近一次广播命令", self.last_broadcast_label)
+        anomaly_layout.addRow("最近状态异常", self.last_status_label)
+        anomaly_layout.addRow("最近命令失败", self.last_command_fail_label)
+        anomaly_layout.addRow("最近串口异常", self.last_serial_error_label)
+        anomaly_layout.addRow("最近广播命令", self.last_broadcast_label)
 
         self.chart_panel = RealtimeChartPanel()
+        self.chart_panel.setMinimumHeight(420)
         self.status_panel = StatusPanel()
         self.raw_frames = RawFramesWidget()
 
-        right_split = QSplitter(Qt.Vertical)
-        right_split.addWidget(self.status_panel)
-        right_split.addWidget(self.raw_frames)
-        right_split.setStretchFactor(0, 3)
-        right_split.setStretchFactor(1, 4)
+        detail_tab = QWidget()
+        detail_layout = QVBoxLayout(detail_tab)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setSpacing(8)
+        detail_intro = QLabel("密度、信号和温度通道等次级信息按需查看，不再常驻主视区。")
+        detail_intro.setWordWrap(True)
+        detail_intro.setProperty("muted", True)
+        detail_layout.addWidget(detail_intro)
+        detail_layout.addWidget(self.detail_cards, 1)
 
-        lower_split = QSplitter(Qt.Horizontal)
-        lower_split.addWidget(self.chart_panel)
-        lower_split.addWidget(right_split)
-        lower_split.setStretchFactor(0, 5)
-        lower_split.setStretchFactor(1, 4)
+        diagnostic_tab = QWidget()
+        diagnostic_layout = QVBoxLayout(diagnostic_tab)
+        diagnostic_layout.setContentsMargins(0, 0, 0, 0)
+        diagnostic_layout.setSpacing(8)
+        diagnostic_layout.addWidget(anomaly_box)
+        diagnostic_layout.addWidget(self.monitor_cards)
+        diagnostic_note = QLabel("详细串口与会话诊断已迁移到“连接与设置”页。")
+        diagnostic_note.setWordWrap(True)
+        diagnostic_note.setProperty("muted", True)
+        diagnostic_layout.addWidget(diagnostic_note)
+        diagnostic_layout.addStretch(1)
+
+        self.monitor_aux_tabs = QTabWidget()
+        self.monitor_aux_tabs.addTab(self.status_panel, "状态面板")
+        self.monitor_aux_tabs.addTab(detail_tab, "扩展数据")
+        self.monitor_aux_tabs.addTab(self.raw_frames, "原始帧")
+        self.monitor_aux_tabs.addTab(diagnostic_tab, "异常摘要 / 诊断")
+        self.monitor_aux_tabs.setMinimumHeight(220)
+
+        body_split = QSplitter(Qt.Vertical)
+        body_split.setChildrenCollapsible(False)
+        body_split.addWidget(self.chart_panel)
+        body_split.addWidget(self.monitor_aux_tabs)
+        body_split.setSizes([720, 260])
 
         layout.addWidget(self.data_cards)
-        layout.addWidget(self.monitor_cards)
-        layout.addWidget(anomaly_box)
-        layout.addWidget(lower_split, 1)
+        layout.addWidget(body_split, 1)
         return page
 
     def _build_control_page(self) -> QWidget:
@@ -631,6 +700,8 @@ class SessionWidget(QWidget):
         self.profile_combo.currentIndexChanged.connect(self._profile_changed)
         self.raw_send_button.clicked.connect(self._send_raw_command)
         self.freeze_button.toggled.connect(self._toggle_freeze)
+        self.pages.currentChanged.connect(self._handle_page_changed)
+        self.monitor_aux_tabs.currentChanged.connect(self._handle_monitor_aux_tab_changed)
 
         for panel in self._command_panels():
             panel.command_requested.connect(self._handle_command_request)
@@ -647,6 +718,58 @@ class SessionWidget(QWidget):
         self.controller.command_completed.connect(self._handle_command_result)
         self.controller.error.connect(self._handle_error_message)
         self.controller.info.connect(self._handle_info_message)
+
+    def _handle_page_changed(self, index: int) -> None:
+        if index == self.monitor_tab_index and self.last_frame is not None and not self.monitor_frozen:
+            self._update_data_cards(self.last_frame)
+            self.chart_panel.request_refresh(immediate=True)
+            self.status_panel.update_frame(self.last_frame)
+        if index == self.expert_tab_index:
+            self._flush_terminal_buffer()
+
+    def _handle_monitor_aux_tab_changed(self, index: int) -> None:
+        widget = self.monitor_aux_tabs.widget(index)
+        if widget is self.status_panel and self.last_frame is not None:
+            self.status_panel.update_frame(self.last_frame)
+        if widget is self.raw_frames:
+            self.raw_frames.render()
+
+    def _schedule_diagnostic_snapshot_refresh(self, *, immediate: bool = False) -> None:
+        self._diagnostic_snapshot_dirty = True
+        if immediate:
+            self._flush_diagnostic_snapshot()
+            return
+        if not self.diagnostic_snapshot_timer.isActive():
+            self.diagnostic_snapshot_timer.start()
+
+    def _flush_diagnostic_snapshot(self) -> None:
+        if not self._diagnostic_snapshot_dirty:
+            return
+        self._diagnostic_snapshot_dirty = False
+        self._refresh_diagnostic_snapshot()
+
+    def _queue_terminal_line(self, line: str) -> None:
+        self._expert_terminal_pending.append(line)
+        if self.pages.currentIndex() == self.expert_tab_index:
+            if not self.expert_terminal_timer.isActive():
+                self.expert_terminal_timer.start()
+
+    def _flush_terminal_buffer(self) -> None:
+        if not self._expert_terminal_pending:
+            return
+        if self.pages.currentIndex() != self.expert_tab_index:
+            return
+        cursor = self.raw_terminal_log.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        existing_text = bool(self.raw_terminal_log.toPlainText())
+        for line in self._expert_terminal_pending:
+            if existing_text:
+                cursor.insertText("\n")
+            cursor.insertText(line)
+            existing_text = True
+        self.raw_terminal_log.setTextCursor(cursor)
+        self.raw_terminal_log.ensureCursorVisible()
+        self._expert_terminal_pending.clear()
 
     def _apply_persisted_state(self, state: dict) -> None:
         if not state:
@@ -1097,9 +1220,10 @@ class SessionWidget(QWidget):
         QMessageBox.information(self, "回放结束", "CSV 回放已完成。")
 
     def _apply_replay_frame(self, frame: ParsedFrame) -> None:
-        self._update_data_cards(frame)
         self.chart_panel.add_frame(frame)
-        self.status_panel.update_frame(frame)
+        if self.pages.currentIndex() == self.monitor_tab_index:
+            self._update_data_cards(frame)
+            self.status_panel.update_frame(frame)
         self.raw_frames.append_record(RawFrameRecord(timestamp=frame.timestamp, direction="REPLAY", text=frame.raw))
         decoded = YGasProtocol.decode_status(frame.status)
         active_alarm_bits = {item.bit for item in decoded if item.is_alarm}
@@ -1115,6 +1239,7 @@ class SessionWidget(QWidget):
         self.status_panel.clear()
         self.raw_frames.clear_records()
         self.data_cards.update_items([])
+        self.detail_cards.update_items([])
         self.monitor_cards.update_items([])
 
     def _set_command_replay_block(self, blocked: bool) -> None:
@@ -1197,7 +1322,7 @@ class SessionWidget(QWidget):
             and not self.replay_running
             and self._current_session_mode() != SESSION_MODE_LISTEN_ONLY
         )
-        self.pages.setTabVisible(4, self.show_expert_check.isChecked())
+        self.pages.setTabVisible(self.expert_tab_index, self.show_expert_check.isChecked())
         for panel in self._command_panels():
             panel.set_permission_level(self.permission_combo.currentText())
             panel.set_connected(self.connected)
@@ -1262,17 +1387,27 @@ class SessionWidget(QWidget):
             self.chart_panel.clear()
             for frame in list(self.controller.frames):
                 self.chart_panel.add_frame(frame)
+            self.chart_panel.request_refresh(immediate=True)
             latest = self.controller.frames[-1]
             self._update_data_cards(latest)
             self.status_panel.clear()
             self.status_panel.update_frame(latest)
             for alarm in list(self.controller.alarms):
                 self.status_panel.append_alarm(alarm)
+        else:
+            self.chart_panel.clear()
+            self.status_panel.clear()
+            self.data_cards.update_items([])
+            self.detail_cards.update_items([])
+            self.monitor_cards.update_items([])
         self.raw_frames.clear_records()
         for record in list(self.controller.raw_records):
             self.raw_frames.append_record(record)
+        self.raw_frames.render()
         if self.last_metrics is not None:
             self._handle_metrics(self.last_metrics, from_signal=False)
+        else:
+            self.monitor_cards.update_items([])
 
     def _update_target_badge(self) -> None:
         target = self._current_target_id()
@@ -1351,7 +1486,7 @@ class SessionWidget(QWidget):
         self.latest_frame_time = frame.timestamp
         self.latest_frame_label.setText(f"最近有效帧: {self._fmt_ts(frame.timestamp)}")
         self._rx_frame_times.append(time.monotonic())
-        self._refresh_diagnostic_snapshot()
+        self._schedule_diagnostic_snapshot_refresh()
         if self.monitor_frozen:
             return
         self._update_data_cards(frame)
@@ -1368,7 +1503,7 @@ class SessionWidget(QWidget):
         if not self.monitor_frozen:
             self.raw_frames.append_record(record)
         if record.direction in {"TX", "RX", "SYS", "REPLAY"}:
-            self.raw_terminal_log.appendPlainText(f"[{self._fmt_ts(record.timestamp)}] [{record.direction}] {record.text}")
+            self._queue_terminal_line(f"[{self._fmt_ts(record.timestamp)}] [{record.direction}] {record.text}")
 
     @Slot(object)
     def _handle_alarm(self, alarm: AlarmEvent) -> None:
@@ -1420,13 +1555,13 @@ class SessionWidget(QWidget):
             self.broadcast_check.setChecked(False)
             self.broadcast_check.blockSignals(False)
             self._update_target_badge()
-        self._refresh_diagnostic_snapshot()
+        self._schedule_diagnostic_snapshot_refresh(immediate=True)
         self._apply_permission_mode()
 
     @Slot(object)
     def _handle_command_result(self, result: CommandResult) -> None:
         state = "成功" if result.ok else "失败"
-        self.raw_terminal_log.appendPlainText(f"[{self._fmt_ts(result.timestamp)}] 命令{state}: {result.command} | {result.message}")
+        self._queue_terminal_line(f"[{self._fmt_ts(result.timestamp)}] 命令{state}: {result.command} | {result.message}")
         if result.ok:
             self._cmd_success_times.append(time.monotonic())
         else:
@@ -1436,7 +1571,7 @@ class SessionWidget(QWidget):
             self.status_panel.append_event("命令", self._fmt_ts(result.timestamp), f"{result.command} -> {result.message}")
             if "超时" in result.message:
                 self.last_command_timeout = f"{self._fmt_ts(result.timestamp)} | {result.command}"
-                self._refresh_diagnostic_snapshot()
+                self._schedule_diagnostic_snapshot_refresh()
 
         for panel in self._command_panels():
             panel.set_last_response(result.command, result.ok, result.message)
@@ -1459,35 +1594,60 @@ class SessionWidget(QWidget):
         fields = frame.fields
         active_alarm_count = int(fields.get("active_alarm_count") or 0)
         status_severity = "alarm" if active_alarm_count > 0 else "normal"
-        if frame.mode == 1:
-            items = [
-                ("设备地址", frame.device_id or "--", "", "MODE1", "normal"),
-                ("CO2 浓度", self._fmt(fields.get("co2_ppm"), 3), "ppm", "实时主指标", "normal"),
-                ("H2O 浓度", self._fmt(fields.get("h2o_mmol"), 3), "mmol/mol", "实时主指标", "normal"),
-                ("CO2 信号", self._fmt(fields.get("co2_signal"), 2), "", "MODE1 信号强度", "normal"),
-                ("H2O 信号", self._fmt(fields.get("h2o_signal"), 2), "", "MODE1 信号强度", "normal"),
-                ("温度", self._fmt(fields.get("temperature_c"), 2), "℃", "设备温度", "normal"),
-                ("压力", self._fmt(fields.get("pressure_kpa"), 2), "kPa", "腔内压力", "normal"),
-                ("状态寄存器", frame.status or "--", "", f"告警数: {active_alarm_count}", status_severity),
-                ("校验和", str(fields.get("checksum") or "--"), "", "原始帧校验字段", "normal"),
-                ("最新原始帧", frame.raw[:40] + ("..." if len(frame.raw) > 40 else ""), "", "用于快速确认接收内容", "normal"),
-            ]
-        else:
-            items = [
-                ("设备地址", frame.device_id or "--", "", "MODE2", "normal"),
-                ("CO2 浓度", self._fmt(fields.get("co2_ppm"), 3), "ppm", "实时主指标", "normal"),
-                ("H2O 浓度", self._fmt(fields.get("h2o_mmol"), 3), "mmol/mol", "实时主指标", "normal"),
-                ("CO2 密度", self._fmt(fields.get("co2_density"), 3), "mg/m³", "MODE2 扩展字段", "normal"),
-                ("H2O 密度", self._fmt(fields.get("h2o_density"), 3), "g/m³", "MODE2 扩展字段", "normal"),
-                ("CO2 比值(滤波)", self._fmt(fields.get("co2_ratio_f"), 4), "", "滤波值", "normal"),
-                ("CO2 比值(原始)", self._fmt(fields.get("co2_ratio_raw"), 4), "", "原始值", "normal"),
-                ("H2O 比值(滤波)", self._fmt(fields.get("h2o_ratio_f"), 4), "", "滤波值", "normal"),
-                ("H2O 比值(原始)", self._fmt(fields.get("h2o_ratio_raw"), 4), "", "原始值", "normal"),
-                ("参考信号", self._fmt(fields.get("ref_signal"), 0), "", "原始光学通道", "normal"),
-                ("腔温 / 壳温", f"{self._fmt(fields.get('chamber_temp_c'), 2)} / {self._fmt(fields.get('case_temp_c'), 2)}", "℃", "温度双通道", "normal"),
-                ("状态寄存器", frame.status or "--", "", f"extras: {len(frame.extras)}", status_severity),
-            ]
-        self.data_cards.update_items(items)
+        temperature_value = fields.get("temperature_c")
+        if temperature_value is None:
+            temperature_value = fields.get("chamber_temp_c")
+        if temperature_value is None:
+            temperature_value = fields.get("case_temp_c")
+        status_text = f"报警 {active_alarm_count}" if active_alarm_count > 0 else ("正常" if frame.status else "--")
+        status_detail = f"MODE{frame.mode} | 寄存器 {frame.status or '--'}"
+        co2_delta = self._fmt_ratio_delta(
+            fields.get("co2_ratio_raw"),
+            fields.get("co2_ratio_f"),
+            fallback=self.last_metrics.filter_bias if self.last_metrics is not None else None,
+        )
+        h2o_delta = self._fmt_ratio_delta(fields.get("h2o_ratio_raw"), fields.get("h2o_ratio_f"))
+        primary_items = [
+            ("CO2 浓度", self._fmt(fields.get("co2_ppm"), 3), "ppm", "实时主指标", "normal"),
+            ("H2O 浓度", self._fmt(fields.get("h2o_mmol"), 3), "mmol/mol", "实时主指标", "normal"),
+            ("温度", self._fmt(temperature_value, 2), "℃", "当前主温度通道", "normal"),
+            ("压力", self._fmt(fields.get("pressure_kpa"), 2), "kPa", "当前腔压", "normal"),
+            ("状态 / 告警", status_text, "", status_detail, status_severity),
+            ("CO2 原始比值", self._fmt(fields.get("co2_ratio_raw"), 4), "", "raw", "normal"),
+            ("CO2 滤波比值", self._fmt(fields.get("co2_ratio_f"), 4), "", "filt", "normal"),
+            ("CO2 滤波差值", co2_delta, "ratio", "filt - raw", "normal"),
+            ("H2O 原始比值", self._fmt(fields.get("h2o_ratio_raw"), 4), "", "raw", "normal"),
+            ("H2O 滤波比值", self._fmt(fields.get("h2o_ratio_f"), 4), "", "filt", "normal"),
+            ("H2O 滤波差值", h2o_delta, "ratio", "filt - raw", "normal"),
+        ]
+        secondary_items = [
+            ("设备地址", frame.device_id or "--", "", f"MODE{frame.mode}", "normal"),
+            ("CO2 密度", self._fmt(fields.get("co2_density"), 3), "mg/m³", "扩展浓度视角", "normal"),
+            ("H2O 密度", self._fmt(fields.get("h2o_density"), 3), "g/m³", "扩展浓度视角", "normal"),
+            ("参考信号", self._fmt(fields.get("ref_signal"), 0), "", "原始光学通道", "normal"),
+            ("CO2 信号", self._fmt(fields.get("co2_signal"), 2), "", "信号强度", "normal"),
+            ("H2O 信号", self._fmt(fields.get("h2o_signal"), 2), "", "信号强度", "normal"),
+            (
+                "腔温 / 壳温",
+                f"{self._fmt(fields.get('chamber_temp_c'), 2)} / {self._fmt(fields.get('case_temp_c'), 2)}",
+                "℃",
+                "双温度通道",
+                "normal",
+            ),
+            ("状态寄存器", frame.status or "--", "", f"checksum: {fields.get('checksum') or '--'}", status_severity),
+        ]
+        self.data_cards.update_items(primary_items)
+        self.detail_cards.update_items(secondary_items)
+
+    @staticmethod
+    def _fmt_ratio_delta(raw_value: object, filtered_value: object, fallback: object | None = None) -> str:
+        if isinstance(raw_value, (int, float)) and isinstance(filtered_value, (int, float)):
+            delta = float(filtered_value) - float(raw_value)
+            if math.isfinite(delta):
+                return f"{delta:.5f}"
+        if isinstance(fallback, (int, float)) and math.isfinite(float(fallback)):
+            return f"{float(fallback):.5f}"
+        return "--"
 
     def _handle_error_message(self, message: str) -> None:
         now_text = self._fmt_ts(datetime.now())
@@ -1500,17 +1660,17 @@ class SessionWidget(QWidget):
             self.status_panel.append_event("串口", now_text, message)
             if not self.connected and self.auto_reconnect_check.isChecked():
                 self._schedule_auto_reconnect()
-        self._refresh_diagnostic_snapshot()
+        self._schedule_diagnostic_snapshot_refresh()
         self._update_anomaly_summary()
 
     def _handle_info_message(self, message: str) -> None:
         self._append_info_message(message)
         if message.startswith("已连接"):
             self.last_connect_time = datetime.now()
-            self._refresh_diagnostic_snapshot()
+            self._schedule_diagnostic_snapshot_refresh()
 
     def _append_info_message(self, message: str) -> None:
-        self.raw_terminal_log.appendPlainText(f"[{self._fmt_ts(datetime.now())}] [SYS] {message}")
+        self._queue_terminal_line(f"[{self._fmt_ts(datetime.now())}] [SYS] {message}")
 
     def _schedule_auto_reconnect(self) -> None:
         if not self.auto_reconnect_check.isChecked() or self.replay_running or self.connected:

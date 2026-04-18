@@ -28,6 +28,8 @@ class RawFramesWidget(QWidget):
         self._records: deque[RawFrameRecord] = deque(maxlen=3000)
         self._paused = False
         self._pending_lines: list[str] = []
+        self._render_dirty = False
+        self._last_count_text = "0 条"
         self._append_timer = QTimer(self)
         self._append_timer.setSingleShot(True)
         self._append_timer.setInterval(80)
@@ -47,7 +49,7 @@ class RawFramesWidget(QWidget):
         self.max_records_spin = QSpinBox()
         self.max_records_spin.setRange(200, 10000)
         self.max_records_spin.setValue(3000)
-        self.count_label = QLabel("0 条")
+        self.count_label = QLabel(self._last_count_text)
         self.count_label.setProperty("muted", True)
 
         controls.addWidget(self.filter_mode_combo)
@@ -78,8 +80,11 @@ class RawFramesWidget(QWidget):
     def append_record(self, record: RawFrameRecord) -> None:
         self._records.append(record)
         self._trim_records()
-        self.count_label.setText(f"{len(self._records)} 条")
+        self._update_count_label()
         if self._paused:
+            return
+        if not self.isVisible():
+            self._render_dirty = True
             return
 
         line = self._format_record(record)
@@ -92,6 +97,10 @@ class RawFramesWidget(QWidget):
 
     def render(self) -> None:
         self._pending_lines.clear()
+        if not self.isVisible():
+            self._render_dirty = True
+            return
+
         lines = []
         for record in self._records:
             text = self._format_record(record)
@@ -101,12 +110,14 @@ class RawFramesWidget(QWidget):
         cursor = self.viewer.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         self.viewer.setTextCursor(cursor)
+        self._render_dirty = False
 
     def clear_records(self) -> None:
         self._records.clear()
         self._pending_lines.clear()
+        self._render_dirty = False
         self.viewer.clear()
-        self.count_label.setText("0 条")
+        self._update_count_label(force_text="0 条")
 
     def _copy_visible_text(self) -> None:
         QGuiApplication.clipboard().setText(self.viewer.toPlainText())
@@ -121,7 +132,10 @@ class RawFramesWidget(QWidget):
 
     def _update_max_records(self, value: int) -> None:
         self._records = deque(self._records, maxlen=max(200, int(value)))
-        self.render()
+        if self.isVisible():
+            self.render()
+        else:
+            self._render_dirty = True
 
     def _trim_records(self) -> None:
         maxlen = max(200, int(self.max_records_spin.value()))
@@ -144,6 +158,10 @@ class RawFramesWidget(QWidget):
     def _flush_pending_lines(self) -> None:
         if not self._pending_lines or self._paused:
             return
+        if not self.isVisible():
+            self._pending_lines.clear()
+            self._render_dirty = True
+            return
         cursor = self.viewer.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         has_existing_text = bool(self.viewer.toPlainText())
@@ -155,6 +173,19 @@ class RawFramesWidget(QWidget):
         self.viewer.setTextCursor(cursor)
         self.viewer.ensureCursorVisible()
         self._pending_lines.clear()
+        self._render_dirty = False
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._render_dirty and not self._paused:
+            QTimer.singleShot(0, self.render)
+
+    def _update_count_label(self, *, force_text: str | None = None) -> None:
+        text = force_text or f"{len(self._records)} 条"
+        if text == self._last_count_text:
+            return
+        self._last_count_text = text
+        self.count_label.setText(text)
 
     @staticmethod
     def _format_record(record: RawFrameRecord) -> str:

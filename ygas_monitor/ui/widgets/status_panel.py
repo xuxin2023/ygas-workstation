@@ -21,11 +21,17 @@ from ...protocols.ygas import YGasProtocol
 class StatusPanel(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
+        self._pending_frame: ParsedFrame | None = None
+        self._last_status_key: tuple[str, int] | None = None
+        self._last_device_text = "设备: --"
+        self._last_mode_text = "模式: --"
+        self._last_status_text = "状态寄存器: --"
+
         layout = QVBoxLayout(self)
         summary_row = QHBoxLayout()
-        self.device_label = QLabel("设备: --")
-        self.mode_label = QLabel("模式: --")
-        self.status_label = QLabel("状态寄存器: --")
+        self.device_label = QLabel(self._last_device_text)
+        self.mode_label = QLabel(self._last_mode_text)
+        self.status_label = QLabel(self._last_status_text)
         summary_row.addWidget(self.device_label)
         summary_row.addWidget(self.mode_label)
         summary_row.addWidget(self.status_label)
@@ -46,9 +52,19 @@ class StatusPanel(QWidget):
         layout.addWidget(event_box, 1)
 
     def update_frame(self, frame: ParsedFrame) -> None:
-        self.device_label.setText(f"设备: {frame.device_id or '--'}")
-        self.mode_label.setText(f"模式: MODE{frame.mode}")
-        self.status_label.setText(f"状态寄存器: {frame.status or '--'}")
+        self._pending_frame = frame
+        if not self.isVisible():
+            return
+        self._apply_frame(frame)
+
+    def _apply_frame(self, frame: ParsedFrame) -> None:
+        self._set_label(self.device_label, f"设备: {frame.device_id or '--'}", "_last_device_text")
+        self._set_label(self.mode_label, f"模式: MODE{frame.mode}", "_last_mode_text")
+        self._set_label(self.status_label, f"状态寄存器: {frame.status or '--'}", "_last_status_text")
+
+        status_key = (frame.status or "", int(frame.mode))
+        if status_key == self._last_status_key:
+            return
 
         decoded = YGasProtocol.decode_status(frame.status)
         self.table.setRowCount(len(decoded))
@@ -57,6 +73,7 @@ class StatusPanel(QWidget):
             self.table.setItem(row, 1, QTableWidgetItem(item.label))
             self.table.setItem(row, 2, QTableWidgetItem(item.state_text))
             self.table.setItem(row, 3, QTableWidgetItem(item.description))
+        self._last_status_key = status_key
 
     def append_alarm(self, alarm: AlarmEvent) -> None:
         self.append_event("状态", alarm.timestamp.strftime("%H:%M:%S.%f")[:-3], alarm.message)
@@ -66,8 +83,21 @@ class StatusPanel(QWidget):
         self.events.insertItem(0, item)
 
     def clear(self) -> None:
-        self.device_label.setText("设备: --")
-        self.mode_label.setText("模式: --")
-        self.status_label.setText("状态寄存器: --")
+        self._pending_frame = None
+        self._last_status_key = None
+        self._set_label(self.device_label, "设备: --", "_last_device_text")
+        self._set_label(self.mode_label, "模式: --", "_last_mode_text")
+        self._set_label(self.status_label, "状态寄存器: --", "_last_status_text")
         self.table.setRowCount(0)
         self.events.clear()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._pending_frame is not None:
+            self._apply_frame(self._pending_frame)
+
+    def _set_label(self, label: QLabel, text: str, attr_name: str) -> None:
+        if getattr(self, attr_name) == text:
+            return
+        setattr(self, attr_name, text)
+        label.setText(text)
