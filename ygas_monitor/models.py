@@ -20,10 +20,10 @@ class SerialSettings:
 @dataclass(slots=True)
 class SessionConfig:
     serial: SerialSettings = field(default_factory=SerialSettings)
-    mode_preference: str = "AUTO"
+    mode_preference: str = "MODE2"
     acquisition_mode: str = "LISTEN"
-    listen_only: bool = True
-    session_mode: str = "LISTEN_ONLY"
+    listen_only: bool = False
+    session_mode: str = "ENGINEERING"
     stream_hz: int = 10
     poll_interval_ms: int = 200
     command_timeout_ms: int = 2000
@@ -32,7 +32,7 @@ class SessionConfig:
     session_note: str = ""
     profile_name: str = "bench_default"
     target_id: str = "001"
-    permission_level: str = "READ_ONLY"
+    permission_level: str = "CONFIG"
     session_name: str = "session"
 
 
@@ -91,3 +91,6 @@ class CommandResult:
     ok: bool
     message: str
     response_lines: list[str] = field(default_factory=list)
+    response_kind: str = ""
+    response_device_id: str | None = None
+    parsed_payload: dict[str, Any] = field(default_factory=dict)

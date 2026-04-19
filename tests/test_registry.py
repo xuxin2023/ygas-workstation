@@ -81,12 +81,34 @@ class RegistryTests(unittest.TestCase):
         manual_query = registry.get("AVERAGE2_QUERY", "manual_default")
         bench_query = registry.get("AVERAGE2_QUERY", "bench_default")
 
-        self.assertIn("CO2", manual.display_name)
-        self.assertIn("CO2", manual.parameter_help)
-        self.assertIn("H2O", bench.display_name)
-        self.assertIn("H2O", bench.parameter_help)
-        self.assertIn("H2O", manual_query.display_name)
-        self.assertIn("CO2", bench_query.display_name)
+        self.assertIn("气滤波窗口", manual.display_name)
+        self.assertIn("气滤波窗口", manual.parameter_help)
+        self.assertIn("水滤波窗口", bench.display_name)
+        self.assertIn("水滤波窗口", bench.parameter_help)
+        self.assertIn("水滤波窗口", manual_query.display_name)
+        self.assertIn("气滤波窗口", bench_query.display_name)
+
+    def test_default_target_uses_fff_for_write_and_explicit_target_for_read(self) -> None:
+        registry = CommandRegistry()
+
+        self.assertEqual(registry.default_target_for_command("MODE", "012"), "FFF")
+        self.assertEqual(registry.default_target_for_command("SENCO1", "012"), "FFF")
+        self.assertEqual(registry.default_target_for_command("GETCO", "012"), "012")
+        self.assertEqual(registry.default_target_for_command("READDATA", "012"), "012")
+
+    def test_senco_preview_is_normalized_to_standard_scientific_notation(self) -> None:
+        registry = CommandRegistry()
+
+        preview = registry.build_preview(
+            "SENCO1",
+            "FFF",
+            {"coefficients": " 65916.6, -106614, 0, -0, 1 "},
+        )
+
+        self.assertEqual(
+            preview,
+            "SENCO1,YGAS,FFF,6.59166e04,-1.06614e05,0.00000e00,0.00000e00,1.00000e00",
+        )
 
     def test_query_commands_have_specific_return_types(self) -> None:
         registry = CommandRegistry()
@@ -94,6 +116,49 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(registry.get("MODE_QUERY").return_type, "mode_value")
         self.assertEqual(registry.get("ID_QUERY").return_type, "identity")
         self.assertEqual(registry.get("AVERAGE1_QUERY").return_type, "setting_value")
+
+    def test_settings_with_safe_readback_expose_readback_metadata(self) -> None:
+        registry = CommandRegistry()
+
+        self.assertEqual(registry.get("MODE").readback_command_id, "MODE_QUERY")
+        self.assertEqual(registry.get("SETCOM").readback_command_id, "SETCOM_QUERY")
+        self.assertEqual(registry.get("SENCO1").readback_command_id, "GETCO")
+        self.assertIsNone(registry.get("SETILLUM").readback_command_id)
+        self.assertIsNone(registry.get("SETCOMWAY").readback_command_id)
+
+    def test_build_readback_preview_uses_query_command_and_explicit_target(self) -> None:
+        registry = CommandRegistry()
+
+        definition, payload = registry.build_readback_preview("SENCO3", "012")
+
+        self.assertEqual(definition.command_id, "GETCO")
+        self.assertEqual(payload, "GETCO,YGAS,012,3")
+
+    def test_adapt_readback_result_prefills_senco_with_normalized_coefficients(self) -> None:
+        registry = CommandRegistry()
+
+        payload = registry.adapt_readback_result(
+            "SENCO1",
+            {"C0": 65916.6, "C1": -106614, "C2": 0},
+        )
+
+        self.assertEqual(
+            payload["prefill_values"]["coefficients"],
+            "6.59166e04,-1.06614e05,0.00000e00",
+        )
+
+    def test_adapt_readback_result_prefills_serial_settings(self) -> None:
+        registry = CommandRegistry()
+
+        payload = registry.adapt_readback_result(
+            "SETCOM",
+            {"device_id": "012", "baudrate": 115200, "bytesize": 8, "parity": "N", "stopbits": 1},
+        )
+
+        self.assertEqual(
+            payload["prefill_values"],
+            {"baudrate": "115200", "bytesize": "8", "parity": "N", "stopbits": "1"},
+        )
 
     def test_custom_template_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

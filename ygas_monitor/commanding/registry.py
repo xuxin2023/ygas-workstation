@@ -10,6 +10,7 @@ from typing import Any
 
 from ..config import COMMAND_TEMPLATE_PATH, DATA_DIR, OLD_COMMAND_TEMPLATE_PATH, ensure_runtime_dirs
 from ..protocols.profiles import get_profile
+from ..protocols.senco_format import normalize_senco_coefficient, normalize_senco_input
 from ..protocols.ygas import YGasProtocol
 
 BROADCAST_FORBIDDEN = "forbidden"
@@ -49,6 +50,7 @@ class CommandDefinition:
     return_type: str
     required_permission: str
     parameters: list[CommandParameter] = field(default_factory=list)
+    readback_command_id: str | None = None
     builtin: bool = True
 
     @property
@@ -62,6 +64,58 @@ class CommandDefinition:
 
 
 class CommandRegistry:
+    READBACK_COMMAND_MAP = {
+        "ID": "ID_QUERY",
+        "MODE": "MODE_QUERY",
+        "SETCOM": "SETCOM_QUERY",
+        "FTD": "FTD_QUERY",
+        "SETPOW": "SETPOW_QUERY",
+        "SETCO2": "SETCO2_QUERY",
+        "TIMEOUT": "TIMEOUT_QUERY",
+        "SENTEMP1": "SENTEMP1_QUERY",
+        "SENTEMP2": "SENTEMP2_QUERY",
+        "AVERAGE1": "AVERAGE1_QUERY",
+        "AVERAGE2": "AVERAGE2_QUERY",
+    }
+    SETTING_VALUE_PREFILL_KEYS = {
+        "FTD": "hz",
+        "SETPOW": "millivolt",
+        "SETCO2": "millivolt",
+        "TIMEOUT": "counter",
+        "SENTEMP1": "temp_c",
+        "SENTEMP2": "temp_c",
+        "AVERAGE1": "window",
+        "AVERAGE2": "window",
+    }
+    WRITE_COMMAND_IDS = {
+        "MODE",
+        "SETCOMWAY",
+        "FTD",
+        "SETPOW",
+        "SETILLUM",
+        "SETCO2",
+        "TIMEOUT",
+        "ID",
+        "SENTEMP1",
+        "SENTEMP2",
+        "AVERAGE1",
+        "AVERAGE2",
+    }
+    READ_COMMAND_IDS = {
+        "GETCO",
+        "ID_QUERY",
+        "MODE_QUERY",
+        "SETCOM_QUERY",
+        "FTD_QUERY",
+        "SETPOW_QUERY",
+        "SETCO2_QUERY",
+        "TIMEOUT_QUERY",
+        "SENTEMP1_QUERY",
+        "SENTEMP2_QUERY",
+        "AVERAGE1_QUERY",
+        "AVERAGE2_QUERY",
+        "READDATA",
+    }
     RETURN_TYPES = {
         "ack",
         "data",
@@ -77,6 +131,7 @@ class CommandRegistry:
     def __init__(self, template_path: Path | None = None):
         self.template_path = Path(template_path or COMMAND_TEMPLATE_PATH)
         self._definitions = self._build_builtin_catalog()
+        self._definitions = self._attach_readback_metadata(self._definitions)
         self._definitions.update(self._load_custom_catalog())
 
     def all_commands(self, profile_name: str = "bench_default") -> list[CommandDefinition]:
@@ -120,6 +175,111 @@ class CommandRegistry:
         args = self._parameter_values(definition, normalized_values)
         return YGasProtocol.build_command(definition.code, *args, target_id=target_id)
 
+    def readback_command_id_for(self, command_id: str) -> str | None:
+        normalized = str(command_id or "").strip().upper()
+        if normalized.startswith("SENCO"):
+            digits = "".join(ch for ch in normalized if ch.isdigit())
+            if digits:
+                return "GETCO"
+        return self.READBACK_COMMAND_MAP.get(normalized)
+
+    def supports_readback(self, command_id: str) -> bool:
+        return bool(self.readback_command_id_for(command_id))
+
+    def readback_definition(self, command_id: str, profile_name: str = "bench_default") -> CommandDefinition | None:
+        readback_command_id = self.readback_command_id_for(command_id)
+        if not readback_command_id:
+            return None
+        return self.get(readback_command_id, profile_name)
+
+    def readback_values_for(self, command_id: str) -> dict[str, str]:
+        normalized = str(command_id or "").strip().upper()
+        if normalized.startswith("SENCO"):
+            digits = "".join(ch for ch in normalized if ch.isdigit())
+            if digits:
+                return {"index": digits}
+        return {}
+
+    def build_readback_preview(
+        self,
+        command_id: str,
+        target_id: str,
+        *,
+        profile_name: str = "bench_default",
+    ) -> tuple[CommandDefinition, str]:
+        definition = self.readback_definition(command_id, profile_name)
+        if definition is None:
+            raise ValueError(f"{command_id} 没有可用的读取对应项。")
+        payload = self.build_preview(
+            definition.command_id,
+            target_id,
+            self.readback_values_for(command_id),
+            profile_name=profile_name,
+        )
+        return definition, payload
+
+    def adapt_readback_result(self, command_id: str, parsed_payload: dict[str, Any]) -> dict[str, Any]:
+        normalized = str(command_id or "").strip().upper()
+        payload = dict(parsed_payload or {})
+
+        if normalized == "ID":
+            device_id = str(payload.get("device_id") or "").upper()
+            return {
+                "current_value": f"当前设备 ID：{device_id}" if device_id else "--",
+                "prefill_values": {},
+            }
+        if normalized == "MODE":
+            mode = payload.get("mode")
+            mode_text = f"MODE{mode}" if mode not in (None, "") else "--"
+            return {
+                "current_value": f"当前工作模式：{mode_text}",
+                "prefill_values": {"mode": str(mode)} if mode not in (None, "") else {},
+            }
+        if normalized == "SETCOM":
+            baudrate = str(payload.get("baudrate") or "")
+            bytesize = str(payload.get("bytesize") or "")
+            parity = str(payload.get("parity") or "")
+            stopbits = str(payload.get("stopbits") or "")
+            summary = " / ".join(item for item in (baudrate, bytesize, parity, stopbits) if item) or "--"
+            prefill = {
+                "baudrate": baudrate,
+                "bytesize": bytesize,
+                "parity": parity,
+                "stopbits": stopbits,
+            }
+            return {
+                "current_value": f"当前通信参数：{summary}",
+                "prefill_values": {key: value for key, value in prefill.items() if value},
+            }
+        if normalized.startswith("SENCO"):
+            coeff_text = self._normalized_coefficients_from_payload(payload)
+            return {
+                "current_value": f"当前系数：{coeff_text}" if coeff_text else "--",
+                "prefill_values": {"coefficients": coeff_text} if coeff_text else {},
+            }
+
+        key = self.SETTING_VALUE_PREFILL_KEYS.get(normalized)
+        value = str(payload.get("value") or "").strip()
+        if not key:
+            return {"current_value": value or "--", "prefill_values": {}}
+        return {
+            "current_value": f"当前值：{value}" if value else "--",
+            "prefill_values": {key: value} if value else {},
+        }
+
+    @classmethod
+    def is_write_command_id(cls, command_id: str) -> bool:
+        normalized = str(command_id or "").strip().upper()
+        return normalized in cls.WRITE_COMMAND_IDS or normalized.startswith(("SENCO", "CLEARSENCO"))
+
+    @classmethod
+    def is_read_command_id(cls, command_id: str) -> bool:
+        return str(command_id or "").strip().upper() in cls.READ_COMMAND_IDS
+
+    @classmethod
+    def default_target_for_command(cls, command_id: str, current_target_id: str) -> str:
+        return "FFF" if cls.is_write_command_id(command_id) else str(current_target_id or "001").strip().upper()
+
     def validate_target(
         self,
         definition: CommandDefinition,
@@ -135,7 +295,7 @@ class CommandRegistry:
             return False, "目标设备 ID 必须是 000-999 三位数字，或 FFF。"
         if normalized != "FFF":
             return True, ""
-        if not broadcast_enabled:
+        if not broadcast_enabled and not self.is_write_command_id(definition.command_id):
             return False, "当前目标地址为 FFF，但尚未显式启用广播开关。"
         if definition.broadcast_policy == BROADCAST_FORBIDDEN:
             return False, f"{definition.display_name} 不允许使用广播地址 FFF。"
@@ -180,6 +340,10 @@ class CommandRegistry:
                 normalized[param.key] = text
                 continue
 
+            if param.kind == "senco_coefficients":
+                normalized[param.key] = normalize_senco_input(text)
+                continue
+
             normalized[param.key] = text
         return normalized
 
@@ -222,20 +386,17 @@ class CommandRegistry:
 
         profile = get_profile(profile_name)
         channel = profile.channel_name(definition.code)
+        channel_label = "水" if channel == "H2O" else "气" if channel == "CO2" else channel
         role = "读取" if definition.command_id.endswith("_QUERY") else "设置"
-        purpose = (
-            f"{role}{definition.code} 滤波参数。当前 profile 下，{definition.code} 对应 {channel} 通道。"
-        )
+        purpose = f"{role}{channel_label}滤波窗口，按 bench 现场规则固定映射到 {channel}。"
         parameter_help = definition.parameter_help
         response_help = definition.response_help
-        display_name = definition.display_name
+        display_name = f"{role}{channel_label}滤波窗口（{definition.code}）"
 
         if definition.command_id.endswith("_QUERY"):
-            display_name = f"读取 {channel} 滤波窗口（{definition.code}）"
-            response_help = f"返回当前 {channel} 通道滤波窗口值。"
+            response_help = f"返回当前{channel_label}滤波窗口（{definition.code}）的值。"
         else:
-            display_name = f"设置 {channel} 滤波窗口（{definition.code}）"
-            parameter_help = f"设置 {channel} 通道对应的 {definition.code} 滤波窗口，范围 1-399。"
+            parameter_help = f"设置{channel_label}滤波窗口（{definition.code}），范围 1-399。"
 
         return replace(
             definition,
@@ -692,7 +853,7 @@ class CommandRegistry:
                         text_param(
                             "coefficients",
                             "系数列表",
-                            kind="text",
+                            kind="senco_coefficients",
                             placeholder="如 1.0,0.0,0.0,0.0,0.0,0.0",
                             description="多个系数使用英文逗号分隔。",
                         )
@@ -848,3 +1009,26 @@ class CommandRegistry:
             )
         )
         return defs
+
+    def _attach_readback_metadata(self, definitions: dict[str, CommandDefinition]) -> dict[str, CommandDefinition]:
+        updated: dict[str, CommandDefinition] = {}
+        for command_id, definition in definitions.items():
+            updated[command_id] = replace(
+                definition,
+                readback_command_id=self.readback_command_id_for(command_id),
+            )
+        return updated
+
+    def _normalized_coefficients_from_payload(self, payload: dict[str, Any]) -> str:
+        ordered_items = sorted(
+            (
+                (str(key).upper(), value)
+                for key, value in payload.items()
+                if str(key).upper().startswith("C") and str(key)[1:].isdigit()
+            ),
+            key=lambda item: int(item[0][1:]),
+        )
+        normalized: list[str] = []
+        for _, value in ordered_items[:6]:
+            normalized.append(normalize_senco_coefficient(str(value)))
+        return ",".join(normalized)
