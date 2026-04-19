@@ -44,7 +44,17 @@ from ..commanding.safety import (
     is_read_only_command,
 )
 from ..config import EXPORT_DIR, LOG_DIR
-from ..models import AlarmEvent, CommandResult, ParsedFrame, RawFrameRecord, SessionConfig, SerialSettings
+from ..models import (
+    AlarmEvent,
+    CommandResult,
+    ParsedFrame,
+    RawFrameRecord,
+    SessionConfig,
+    SerialSettings,
+    SessionWriteStatus,
+    StructuredValueSnapshot,
+    WriteVerificationReport,
+)
 from ..protocols.profiles import PROFILES, get_profile
 from ..protocols.ygas import YGasProtocol
 from ..serial.transport import list_serial_ports
@@ -145,10 +155,12 @@ class SessionWidget(QWidget):
         self._device_auto_upload = True
         self.latest_online_device_id = ""
         self.active_online_device_ids: list[str] = []
-        self._pending_readback_requests: dict[str, str] = {}
+        self._pending_readback_requests: dict[str, dict[str, object]] = {}
+        self._pending_write_verifications: dict[str, dict[str, object]] = {}
         self._monitor_aux_expanded = False
         self._monitor_aux_last_height = 140
         self._device_quick_status = "默认监测配置待连接后应用"
+        self._hard_status_state = SessionWriteStatus()
 
         self.replay_dataset: ReplayDataset | None = None
         self.replay_index = 0
@@ -281,6 +293,7 @@ class SessionWidget(QWidget):
         self.broadcast_banner.hide()
         layout.addWidget(self.broadcast_banner)
 
+        layout.addWidget(self._build_hard_status_bar())
         layout.addWidget(self._build_status_strip())
 
         self.pages = QTabWidget()
@@ -316,6 +329,41 @@ class SessionWidget(QWidget):
             layout.addWidget(widget)
         layout.addStretch(1)
         return container
+
+    def _build_hard_status_bar(self) -> QWidget:
+        box = QGroupBox("会话写入基础状态")
+        layout = QGridLayout(box)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setHorizontalSpacing(14)
+        layout.setVerticalSpacing(6)
+
+        self.hard_online_value_label = QLabel("--")
+        self.hard_target_value_label = QLabel("--")
+        self.hard_send_value_label = QLabel("--")
+        self.hard_write_permission_label = QLabel("禁止")
+        self.hard_reason_value_label = QLabel("--")
+        self.hard_reason_value_label.setWordWrap(True)
+        self.hard_status_help_label = QLabel(
+            "该状态仅表示当前会话是否满足基础写入条件；具体命令仍需通过权限、风险和命令级校验。"
+        )
+        self.hard_status_help_label.setWordWrap(True)
+        self.hard_status_help_label.setProperty("muted", True)
+        self.hard_status_note_label = QLabel("当前选中命令仍会单独校验")
+        self.hard_status_note_label.setProperty("muted", True)
+
+        layout.addWidget(QLabel("在线设备"), 0, 0)
+        layout.addWidget(self.hard_online_value_label, 0, 1)
+        layout.addWidget(QLabel("会话目标"), 0, 2)
+        layout.addWidget(self.hard_target_value_label, 0, 3)
+        layout.addWidget(QLabel("生效发送"), 0, 4)
+        layout.addWidget(self.hard_send_value_label, 0, 5)
+        layout.addWidget(QLabel("基础写入条件"), 1, 0)
+        layout.addWidget(self.hard_write_permission_label, 1, 1)
+        layout.addWidget(QLabel("原因"), 1, 2)
+        layout.addWidget(self.hard_reason_value_label, 1, 3, 1, 3)
+        layout.addWidget(self.hard_status_help_label, 2, 0, 1, 5)
+        layout.addWidget(self.hard_status_note_label, 2, 5, 1, 1)
+        return box
 
     def _build_quick_connect_box(self) -> QWidget:
         box = QGroupBox("快速连接")
@@ -631,6 +679,7 @@ class SessionWidget(QWidget):
 
         self.chart_panel = RealtimeChartPanel()
         self.chart_panel.setMinimumHeight(420)
+        self.chart_config_group = self._build_chart_config_box()
         self.status_panel = StatusPanel()
         self.raw_frames = RawFramesWidget()
 
@@ -677,10 +726,45 @@ class SessionWidget(QWidget):
         self.monitor_body_split.addWidget(self.monitor_aux_container)
         self.monitor_body_split.setSizes([720, 44])
 
+        layout.addWidget(self.chart_config_group)
         layout.addWidget(self.data_cards)
         layout.addWidget(self.monitor_body_split, 1)
         self._set_monitor_aux_expanded(False)
+        self._refresh_chart_config_summary()
         return page
+
+    def _build_chart_config_box(self) -> QWidget:
+        box = QGroupBox("图表配置")
+        layout = QGridLayout(box)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(6)
+
+        self.chart_view_combo = QComboBox()
+        for view_id, title in self.chart_panel.available_views():
+            self.chart_view_combo.addItem(title, view_id)
+        self.chart_add_upper_button = QPushButton("加入上图")
+        self.chart_add_lower_button = QPushButton("加入下图")
+        self.chart_remove_upper_button = QPushButton("从上图移除")
+        self.chart_remove_lower_button = QPushButton("从下图移除")
+        self.chart_restore_defaults_button = QPushButton("恢复默认视图")
+        self.chart_upper_summary_label = QLabel("--")
+        self.chart_upper_summary_label.setWordWrap(True)
+        self.chart_lower_summary_label = QLabel("--")
+        self.chart_lower_summary_label.setWordWrap(True)
+
+        layout.addWidget(QLabel("可选视图"), 0, 0)
+        layout.addWidget(self.chart_view_combo, 0, 1, 1, 2)
+        layout.addWidget(self.chart_add_upper_button, 0, 3)
+        layout.addWidget(self.chart_add_lower_button, 0, 4)
+        layout.addWidget(self.chart_remove_upper_button, 0, 5)
+        layout.addWidget(self.chart_remove_lower_button, 0, 6)
+        layout.addWidget(self.chart_restore_defaults_button, 0, 7)
+        layout.addWidget(QLabel("上图"), 1, 0)
+        layout.addWidget(self.chart_upper_summary_label, 1, 1, 1, 3)
+        layout.addWidget(QLabel("下图"), 1, 4)
+        layout.addWidget(self.chart_lower_summary_label, 1, 5, 1, 3)
+        return box
 
     def _build_control_page(self) -> QWidget:
         self.control_panel = CommandWorkspacePanel(
@@ -901,6 +985,11 @@ class SessionWidget(QWidget):
         self.mode2_quick_button.clicked.connect(lambda: self._request_quick_output_mode("MODE2"))
         self.auto_upload_quick_button.clicked.connect(self._toggle_quick_auto_upload)
         self.apply_default_config_button.clicked.connect(self._apply_default_monitoring_config)
+        self.chart_add_upper_button.clicked.connect(lambda: self._apply_chart_view_to_slot(0))
+        self.chart_add_lower_button.clicked.connect(lambda: self._apply_chart_view_to_slot(1))
+        self.chart_remove_upper_button.clicked.connect(lambda: self._clear_chart_slot(0))
+        self.chart_remove_lower_button.clicked.connect(lambda: self._clear_chart_slot(1))
+        self.chart_restore_defaults_button.clicked.connect(self._restore_chart_defaults)
         self.theme_combo.currentIndexChanged.connect(self._handle_theme_changed)
         self.pages.currentChanged.connect(self._handle_page_changed)
         self.monitor_aux_tabs.currentChanged.connect(self._handle_monitor_aux_tab_changed)
@@ -1229,7 +1318,32 @@ class SessionWidget(QWidget):
             self._set_device_quick_status(f"已将 {label} 切换到{slot_name}。")
         else:
             self._set_device_quick_status("该指标当前没有可用的快捷图槽视图。")
+        self._refresh_chart_config_summary()
         self._refresh_monitor_quick_controls()
+
+    def _apply_chart_view_to_slot(self, slot_index: int) -> None:
+        view_id = str(self.chart_view_combo.currentData() or "")
+        if not view_id:
+            return
+        slot_name = "上图" if slot_index == 0 else "下图"
+        if self.chart_panel.set_slot_view(slot_index, view_id):
+            self._set_device_quick_status(f"已将 {self.chart_view_combo.currentText()} 加入{slot_name}。")
+            self._refresh_chart_config_summary()
+
+    def _clear_chart_slot(self, slot_index: int) -> None:
+        slot_name = "上图" if slot_index == 0 else "下图"
+        if self.chart_panel.clear_slot(slot_index):
+            self._set_device_quick_status(f"已从{slot_name}移除当前变量。")
+            self._refresh_chart_config_summary()
+
+    def _restore_chart_defaults(self) -> None:
+        self.chart_panel.restore_default_views()
+        self._set_device_quick_status("图表已恢复默认视图。")
+        self._refresh_chart_config_summary()
+
+    def _refresh_chart_config_summary(self) -> None:
+        self.chart_upper_summary_label.setText(self.chart_panel.slot_summary_text(0))
+        self.chart_lower_summary_label.setText(self.chart_panel.slot_summary_text(1))
 
     def _apply_persisted_state(self, state: dict) -> None:
         if not state:
@@ -1410,6 +1524,11 @@ class SessionWidget(QWidget):
         self.controller.update_config(self._build_config())
         if is_read_only_command(definition):
             self._remember_safe_command(preview, definition.return_type, definition.display_name)
+            self.controller.send_payload(preview, expectation=definition.return_type, timeout_ms=self._current_command_timeout_ms())
+            return
+        if self._should_auto_verify_write(definition):
+            self._start_write_verification(definition, values, preview)
+            return
         self.controller.send_payload(preview, expectation=definition.return_type, timeout_ms=self._current_command_timeout_ms())
 
     def _handle_readback_request(self, definition: CommandDefinition) -> None:
@@ -1454,13 +1573,78 @@ class SessionWidget(QWidget):
             return
 
         self.controller.update_config(self._build_config())
-        self._pending_readback_requests[payload] = definition.command_id
+        self._pending_readback_requests[payload] = {
+            "command_id": definition.command_id,
+            "phase": "manual",
+            "profile_name": self._current_profile_name(),
+        }
         self._remember_safe_command(payload, readback_definition.return_type, f"{definition.display_name} / 读取当前参数")
         self.controller.send_payload(
             payload,
             expectation=readback_definition.return_type,
             timeout_ms=self._current_command_timeout_ms(),
         )
+
+    def _should_auto_verify_write(self, definition: CommandDefinition) -> bool:
+        return self.registry.is_write_command_id(definition.command_id) and self.registry.supports_readback(definition.command_id)
+
+    def _start_write_verification(
+        self,
+        definition: CommandDefinition,
+        values: dict[str, str],
+        write_payload: str,
+    ) -> None:
+        read_target, target_error = self._resolve_explicit_read_target_id()
+        if target_error:
+            QMessageBox.warning(self, "写前读取失败", target_error)
+            return
+        readback_definition, read_payload = self.registry.build_readback_preview(
+            definition.command_id,
+            read_target,
+            profile_name=self._current_profile_name(),
+        )
+        target_snapshot = self.registry.build_target_snapshot(
+            definition.command_id,
+            values,
+            profile_name=self._current_profile_name(),
+        )
+        self._set_verification_report(
+            definition.command_id,
+            WriteVerificationReport(
+                target=target_snapshot,
+                result_text="写前读取中",
+                detail_text="正在读取写前值，读取成功后才会执行写入。",
+            ),
+        )
+        self._pending_readback_requests[read_payload] = {
+            "command_id": definition.command_id,
+            "phase": "before_write",
+            "profile_name": self._current_profile_name(),
+            "write_payload": write_payload,
+            "write_expectation": definition.return_type,
+            "target_snapshot": target_snapshot,
+            "write_values": dict(values),
+            "post_read_target": self._post_write_read_target(definition.command_id, values, read_target),
+        }
+        self._remember_safe_command(read_payload, readback_definition.return_type, f"{definition.display_name} / 写前读取")
+        self.controller.send_payload(
+            read_payload,
+            expectation=readback_definition.return_type,
+            timeout_ms=self._current_command_timeout_ms(),
+        )
+
+    def _post_write_read_target(self, command_id: str, values: dict[str, str], fallback_target: str) -> str:
+        if str(command_id).upper() == "ID":
+            new_id = str(values.get("new_id") or "").strip().upper()
+            if new_id:
+                return new_id
+        return fallback_target
+
+    def _set_verification_report(self, command_id: str, report: WriteVerificationReport) -> None:
+        panel = self._panel_for_command_id(command_id)
+        if panel is None:
+            return
+        panel.set_verification_report(command_id, report)
 
     def _resolve_explicit_read_target_id(self) -> tuple[str, str]:
         target_id = self._current_target_id()
@@ -1502,6 +1686,12 @@ class SessionWidget(QWidget):
         if panel is self.control_panel:
             command_ids = SAFE_QUERY_COMMAND_IDS
             values_by_id = {command_id: {} for command_id in command_ids}
+            command_sources = {
+                "ID_QUERY": "ID",
+                "MODE_QUERY": "MODE",
+                "FTD_QUERY": "FTD",
+                "SETCOM_QUERY": "SETCOM",
+            }
         elif panel is self.signal_panel:
             command_ids = [
                 "SETPOW_QUERY",
@@ -1513,9 +1703,19 @@ class SessionWidget(QWidget):
                 "AVERAGE2_QUERY",
             ]
             values_by_id = {command_id: {} for command_id in command_ids}
+            command_sources = {
+                "SETPOW_QUERY": "SETPOW",
+                "SETCO2_QUERY": "SETCO2",
+                "TIMEOUT_QUERY": "TIMEOUT",
+                "SENTEMP1_QUERY": "SENTEMP1",
+                "SENTEMP2_QUERY": "SENTEMP2",
+                "AVERAGE1_QUERY": "AVERAGE1",
+                "AVERAGE2_QUERY": "AVERAGE2",
+            }
         else:
             command_ids = ["GETCO"]
             values_by_id = {"GETCO": {"index": str(self._current_coefficient_index())}}
+            command_sources = {"GETCO": self.coeff_panel.current_command().command_id}
 
         for command_id in command_ids:
             definition = self.registry.get(command_id, self._current_profile_name())
@@ -1549,6 +1749,11 @@ class SessionWidget(QWidget):
                 values_by_id[command_id],
                 profile_name=self._current_profile_name(),
             )
+            self._pending_readback_requests[payload] = {
+                "command_id": command_sources.get(command_id, command_id),
+                "phase": "manual",
+                "profile_name": self._current_profile_name(),
+            }
             self._remember_safe_command(payload, definition.return_type, definition.display_name)
             self.controller.send_payload(payload, expectation=definition.return_type, timeout_ms=timeout_ms)
 
@@ -2035,6 +2240,119 @@ class SessionWidget(QWidget):
         self._update_anomaly_summary()
         self._refresh_monitor_quick_controls()
 
+    def _session_write_definition(self) -> CommandDefinition:
+        return self.registry.get("FTD", self._current_profile_name())
+
+    def _current_write_strategy_target(self) -> str:
+        page_index = self.pages.currentIndex() if hasattr(self, "pages") else -1
+        panel: CommandWorkspacePanel | None = None
+        if page_index == self.control_tab_index:
+            panel = self.control_panel
+        elif page_index == self.coeff_tab_index:
+            panel = self.coeff_panel
+        elif page_index == self.signal_tab_index:
+            panel = self.signal_panel
+        elif page_index == self.expert_tab_index:
+            panel = self.custom_panel
+        if panel is not None:
+            detail = panel.detail_widget
+            if detail.definition and self.registry.is_write_command_id(detail.definition.command_id):
+                if detail.force_single_target_check.isChecked():
+                    return detail.target_override_edit.text().strip().upper() or self._current_target_id()
+        return self.registry.default_target_for_command("FTD", self._current_target_id())
+
+    def _summarize_write_block_reason(self, reason: str) -> str:
+        text = str(reason or "")
+        if "只监听" in text:
+            return "只监听模式"
+        if "安全握手" in text:
+            return "安全握手模式"
+        if "只读会话锁" in text:
+            return "只读锁开启"
+        if "回放期间" in text:
+            return "回放模式"
+        if "未连接" in text:
+            return "当前未连接设备"
+        if "多个实时在线设备" in text or "多个在线设备" in text:
+            return "当前无唯一在线设备"
+        if "无法确认实时在线设备" in text:
+            return "当前无唯一在线设备"
+        if "缺少明确目标设备" in text or "目标设备 ID 无效" in text:
+            return "当前会话目标不是单 ID"
+        if "不一致" in text:
+            return "target-online 不一致"
+        return text or "--"
+
+    def _build_session_write_status(self) -> SessionWriteStatus:
+        active_numeric_ids = sorted({device_id for device_id in self.active_online_device_ids if device_id.isdigit()})
+        if len(active_numeric_ids) > 1:
+            online_text = "多个"
+        elif len(active_numeric_ids) == 1:
+            online_text = active_numeric_ids[0]
+        else:
+            online_text = self.latest_online_device_id or "--"
+
+        definition = self._session_write_definition()
+        effective_send = self._current_write_strategy_target()
+        current_permission = self.permission_combo.currentText()
+        safety_ok, safety_reason = can_execute_command(
+            definition,
+            connected=self.connected,
+            session_mode=self._current_session_mode(),
+            read_only_lock=self.read_only_lock_check.isChecked(),
+            replay_running=self.replay_running,
+        )
+        if not safety_ok:
+            return SessionWriteStatus(
+                online_device_text=online_text,
+                session_target_text=self._current_target_id(),
+                effective_send_text=effective_send,
+                write_allowed=False,
+                reason_text=self._summarize_write_block_reason(safety_reason),
+            )
+
+        if not has_permission(current_permission, definition.required_permission):
+            return SessionWriteStatus(
+                online_device_text=online_text,
+                session_target_text=self._current_target_id(),
+                effective_send_text=effective_send,
+                write_allowed=False,
+                reason_text="当前权限等级为只读",
+            )
+
+        mismatch_message = self._online_target_mismatch_message(definition, effective_send)
+        if mismatch_message:
+            return SessionWriteStatus(
+                online_device_text=online_text,
+                session_target_text=self._current_target_id(),
+                effective_send_text=effective_send,
+                write_allowed=False,
+                reason_text=self._summarize_write_block_reason(mismatch_message),
+            )
+
+        return SessionWriteStatus(
+            online_device_text=online_text,
+            session_target_text=self._current_target_id(),
+            effective_send_text=effective_send,
+            write_allowed=True,
+            reason_text="已满足写入条件",
+        )
+
+    def _update_hard_status_bar(self) -> None:
+        self._hard_status_state = self._build_session_write_status()
+        self.hard_online_value_label.setText(self._hard_status_state.online_device_text)
+        self.hard_target_value_label.setText(self._hard_status_state.session_target_text)
+        self.hard_send_value_label.setText(self._hard_status_state.effective_send_text)
+        self.hard_write_permission_label.setText("允许" if self._hard_status_state.write_allowed else "禁止")
+        self.hard_reason_value_label.setText(self._hard_status_state.reason_text)
+        permission_state = "connected" if self._hard_status_state.write_allowed else "fault"
+        self.hard_write_permission_label.setProperty("state", permission_state)
+        self.hard_write_permission_label.style().unpolish(self.hard_write_permission_label)
+        self.hard_write_permission_label.style().polish(self.hard_write_permission_label)
+        self.hard_reason_value_label.setProperty("warning", not self._hard_status_state.write_allowed)
+        self.hard_reason_value_label.style().unpolish(self.hard_reason_value_label)
+        self.hard_reason_value_label.style().polish(self.hard_reason_value_label)
+
     def _update_target_badge(self) -> None:
         target = self._current_target_id()
         is_broadcast = target == "FFF"
@@ -2049,6 +2367,7 @@ class SessionWidget(QWidget):
         self.current_target_label.style().unpolish(self.current_target_label)
         self.current_target_label.style().polish(self.current_target_label)
         self.broadcast_banner.setVisible(is_broadcast)
+        self._update_hard_status_bar()
 
     def _set_connection_state(self, state_key: str, text: str) -> None:
         self.connection_state_label.setText(text)
@@ -2069,6 +2388,7 @@ class SessionWidget(QWidget):
         self.backend_status_label.setText(f"后端: {backend_text}")
         self.lock_status_label.setText(f"只读锁: {'开' if self.read_only_lock_check.isChecked() else '关'}")
         self.simulator_banner.setVisible(self.port_combo.currentText().strip().upper() == "SIMULATOR")
+        self._update_hard_status_bar()
 
     def _update_frame_age_status(self) -> None:
         if self.latest_frame_time is None:
@@ -2194,6 +2514,7 @@ class SessionWidget(QWidget):
             self._device_action_queue.clear()
             self._device_action_active = None
             self._pending_readback_requests.clear()
+            self._pending_write_verifications.clear()
             self.latest_online_device_id = ""
             self.active_online_device_ids = []
             if self._disconnect_expected:
@@ -2232,9 +2553,12 @@ class SessionWidget(QWidget):
             panel.set_last_response(result.command, result.ok, result.message)
         if self.custom_panel is not None:
             self.custom_panel.set_last_response(result.command, result.ok, result.message)
-        readback_command_id = self._pending_readback_requests.pop(result.command, None)
-        if readback_command_id:
-            self._apply_readback_result(readback_command_id, result)
+        pending_readback = self._pending_readback_requests.pop(result.command, None)
+        if pending_readback is not None:
+            self._handle_pending_readback_result(pending_readback, result)
+        pending_write = self._pending_write_verifications.pop(result.command, None)
+        if pending_write is not None:
+            self._handle_pending_write_result(pending_write, result)
         if self._device_action_active is not None:
             steps = self._device_action_active.get("steps", [])
             current_step = steps[0] if steps else None
@@ -2252,6 +2576,151 @@ class SessionWidget(QWidget):
                         self._finish_device_action(ok=True, message=success_text)
         self._update_diagnostic_metrics()
         self._refresh_monitor_quick_controls()
+
+    def _handle_pending_readback_result(self, request: dict[str, object], result: CommandResult) -> None:
+        command_id = str(request.get("command_id") or "")
+        phase = str(request.get("phase") or "manual")
+        profile_name = str(request.get("profile_name") or self._current_profile_name())
+        if result.ok:
+            self._apply_readback_result(command_id, result)
+        if phase == "manual":
+            return
+
+        target_snapshot = request.get("target_snapshot")
+        if not isinstance(target_snapshot, StructuredValueSnapshot):
+            target_snapshot = StructuredValueSnapshot()
+
+        if phase == "before_write":
+            if not result.ok:
+                self._set_verification_report(
+                    command_id,
+                    WriteVerificationReport(
+                        target=target_snapshot,
+                        result_text="写前读取失败",
+                        detail_text=f"未执行写入：{result.message}",
+                    ),
+                )
+                return
+            before_snapshot = self.registry.build_readback_snapshot(
+                command_id,
+                result.parsed_payload,
+                profile_name=profile_name,
+            )
+            self._set_verification_report(
+                command_id,
+                WriteVerificationReport(
+                    before=before_snapshot,
+                    target=target_snapshot,
+                    result_text="写入中",
+                    detail_text="写前值已锁定，正在执行写命令。",
+                ),
+            )
+            write_payload = str(request.get("write_payload") or "")
+            write_expectation = str(request.get("write_expectation") or "ack")
+            if write_payload:
+                self._pending_write_verifications[write_payload] = {
+                    "command_id": command_id,
+                    "profile_name": profile_name,
+                    "before_snapshot": before_snapshot,
+                    "target_snapshot": target_snapshot,
+                    "post_read_target": str(request.get("post_read_target") or ""),
+                }
+                self.controller.send_payload(
+                    write_payload,
+                    expectation=write_expectation,
+                    timeout_ms=self._current_command_timeout_ms(),
+                )
+            return
+
+        if phase == "after_write":
+            before_snapshot = request.get("before_snapshot")
+            if not isinstance(before_snapshot, StructuredValueSnapshot):
+                before_snapshot = StructuredValueSnapshot()
+            if not result.ok:
+                self._set_verification_report(
+                    command_id,
+                    WriteVerificationReport(
+                        before=before_snapshot,
+                        target=target_snapshot,
+                        result_text="无法验证",
+                        detail_text=f"写命令 ACK 成功，但写后读取失败：{result.message}",
+                    ),
+                )
+                return
+            after_snapshot = self.registry.build_readback_snapshot(
+                command_id,
+                result.parsed_payload,
+                profile_name=profile_name,
+            )
+            mismatches = self.registry.diff_structured_snapshots(target_snapshot, after_snapshot)
+            detail_text = "写前、目标、写后已完成复核。"
+            result_text = "一致"
+            if mismatches:
+                result_text = "不一致"
+                detail_text = f"不一致项：{', '.join(mismatches)}"
+            self._set_verification_report(
+                command_id,
+                WriteVerificationReport(
+                    before=before_snapshot,
+                    target=target_snapshot,
+                    after=after_snapshot,
+                    result_text=result_text,
+                    detail_text=detail_text,
+                    verified_at=result.timestamp,
+                    source_device_id=str(result.response_device_id or "--"),
+                ),
+            )
+
+    def _handle_pending_write_result(self, request: dict[str, object], result: CommandResult) -> None:
+        command_id = str(request.get("command_id") or "")
+        profile_name = str(request.get("profile_name") or self._current_profile_name())
+        before_snapshot = request.get("before_snapshot")
+        if not isinstance(before_snapshot, StructuredValueSnapshot):
+            before_snapshot = StructuredValueSnapshot()
+        target_snapshot = request.get("target_snapshot")
+        if not isinstance(target_snapshot, StructuredValueSnapshot):
+            target_snapshot = StructuredValueSnapshot()
+
+        if not result.ok:
+            self._set_verification_report(
+                command_id,
+                WriteVerificationReport(
+                    before=before_snapshot,
+                    target=target_snapshot,
+                    result_text="写入失败",
+                    detail_text=f"未执行写后复核：{result.message}",
+                ),
+            )
+            return
+
+        post_read_target = str(request.get("post_read_target") or "")
+        readback_definition, readback_payload = self.registry.build_readback_preview(
+            command_id,
+            post_read_target,
+            profile_name=profile_name,
+        )
+        self._set_verification_report(
+            command_id,
+            WriteVerificationReport(
+                before=before_snapshot,
+                target=target_snapshot,
+                result_text="写后复核中",
+                detail_text="ACK 成功，正在读取写后值。",
+            ),
+        )
+        self._pending_readback_requests[readback_payload] = {
+            "command_id": command_id,
+            "phase": "after_write",
+            "profile_name": profile_name,
+            "before_snapshot": before_snapshot,
+            "target_snapshot": target_snapshot,
+        }
+        self._remember_safe_command(readback_payload, readback_definition.return_type, f"{command_id} / 写后复核")
+        self.controller.send_payload(
+            readback_payload,
+            expectation=readback_definition.return_type,
+            timeout_ms=self._current_command_timeout_ms(),
+        )
 
     def _apply_readback_result(self, command_id: str, result: CommandResult) -> None:
         if not result.ok:

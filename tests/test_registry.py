@@ -160,6 +160,30 @@ class RegistryTests(unittest.TestCase):
             {"baudrate": "115200", "bytesize": "8", "parity": "N", "stopbits": "1"},
         )
 
+    def test_build_target_and_readback_snapshots_support_structured_compare(self) -> None:
+        registry = CommandRegistry()
+
+        target = registry.build_target_snapshot("MODE", {"mode": "2"})
+        actual = registry.build_readback_snapshot("MODE", {"device_id": "012", "mode": 2})
+
+        self.assertEqual(target.summary, "目标工作模式：MODE2")
+        self.assertEqual(actual.summary, "工作模式：MODE2")
+        self.assertEqual(registry.diff_structured_snapshots(target, actual), [])
+
+    def test_structured_compare_reports_mismatched_fields(self) -> None:
+        registry = CommandRegistry()
+
+        target = registry.build_target_snapshot(
+            "SETCOM",
+            {"baudrate": "115200", "bytesize": "8", "parity": "N", "stopbits": "1"},
+        )
+        actual = registry.build_readback_snapshot(
+            "SETCOM",
+            {"device_id": "012", "baudrate": 9600, "bytesize": 8, "parity": "E", "stopbits": 1},
+        )
+
+        self.assertEqual(registry.diff_structured_snapshots(target, actual), ["校验位", "波特率"])
+
     def test_custom_template_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             registry = CommandRegistry(template_path=Path(temp_dir) / "templates.json")

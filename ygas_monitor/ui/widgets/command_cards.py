@@ -28,6 +28,7 @@ from ...commanding.registry import (
     CommandRegistry,
 )
 from ...commanding.safety import can_execute_command
+from ...models import WriteVerificationReport
 from ...protocols.senco_format import normalize_senco_input
 
 
@@ -58,6 +59,7 @@ class CommandDetailWidget(QGroupBox):
         self.read_only_lock = False
         self._fields: dict[str, QWidget] = {}
         self._hints: dict[str, QLabel] = {}
+        self._verification_report = WriteVerificationReport()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -137,6 +139,34 @@ class CommandDetailWidget(QGroupBox):
         self.readback_device_label.setProperty("muted", True)
         layout.addWidget(self.readback_device_label)
 
+        self.verification_box = QGroupBox("写后自动复核")
+        verification_layout = QFormLayout(self.verification_box)
+        self.verify_before_label = QLabel("--")
+        self.verify_before_label.setWordWrap(True)
+        self.verify_target_label = QLabel("--")
+        self.verify_target_label.setWordWrap(True)
+        self.verify_after_label = QLabel("--")
+        self.verify_after_label.setWordWrap(True)
+        self.verify_result_label = QLabel("--")
+        self.verify_result_label.setWordWrap(True)
+        self.verify_detail_label = QLabel("--")
+        self.verify_detail_label.setWordWrap(True)
+        self.verify_detail_label.setProperty("muted", True)
+        self.verify_time_label = QLabel("--")
+        self.verify_time_label.setWordWrap(True)
+        self.verify_time_label.setProperty("muted", True)
+        self.verify_device_label = QLabel("--")
+        self.verify_device_label.setWordWrap(True)
+        self.verify_device_label.setProperty("muted", True)
+        verification_layout.addRow("写前值", self.verify_before_label)
+        verification_layout.addRow("目标写入值", self.verify_target_label)
+        verification_layout.addRow("写后值", self.verify_after_label)
+        verification_layout.addRow("结果", self.verify_result_label)
+        verification_layout.addRow("说明", self.verify_detail_label)
+        verification_layout.addRow("最近复核时间", self.verify_time_label)
+        verification_layout.addRow("复核来源设备 ID", self.verify_device_label)
+        layout.addWidget(self.verification_box)
+
         self.send_button = QPushButton("执行命令")
         self.send_button.clicked.connect(self._emit_request)
         layout.addWidget(self.send_button)
@@ -193,6 +223,7 @@ class CommandDetailWidget(QGroupBox):
         self.broadcast_value.setText(self._broadcast_policy_label(definition.broadcast_policy))
         self.last_response_label.setText("最近一次响应: --")
         self.set_readback_snapshot(current_value="--", timestamp_text="--", device_id="--")
+        self.set_verification_report(WriteVerificationReport())
         self._rebuild_form()
         self.refresh_preview()
 
@@ -325,6 +356,27 @@ class CommandDetailWidget(QGroupBox):
         self.readback_time_label.setText(f"最近读取时间: {timestamp_text or '--'}")
         self.readback_device_label.setText(f"读取来源设备 ID: {device_id or '--'}")
 
+    def set_verification_report(self, report: WriteVerificationReport) -> None:
+        self._verification_report = report
+        self.verify_before_label.setText(report.before.summary or "--")
+        self.verify_target_label.setText(report.target.summary or "--")
+        self.verify_after_label.setText(report.after.summary or "--")
+        self.verify_result_label.setText(report.result_text or "--")
+        self.verify_detail_label.setText(report.detail_text or "--")
+        self.verify_time_label.setText(
+            report.verified_at.strftime("%H:%M:%S.%f")[:-3] if report.verified_at is not None else "--"
+        )
+        self.verify_device_label.setText(report.source_device_id or "--")
+        risk = "low"
+        if "不一致" in self.verify_result_label.text() or "失败" in self.verify_result_label.text():
+            risk = "high"
+        elif "无法验证" in self.verify_result_label.text() or "复核中" in self.verify_result_label.text():
+            risk = "medium"
+        self.verify_result_label.setProperty("risk", risk)
+        self.verify_result_label.setProperty("muted", self.verify_result_label.text() in {"--", "一致"})
+        self.verify_result_label.style().unpolish(self.verify_result_label)
+        self.verify_result_label.style().polish(self.verify_result_label)
+
     def apply_prefill_values(self, values: dict[str, str]) -> None:
         if not values:
             return
@@ -344,6 +396,7 @@ class CommandDetailWidget(QGroupBox):
         self.readback_value_label.setVisible(visible)
         self.readback_time_label.setVisible(visible)
         self.readback_device_label.setVisible(visible)
+        self.verification_box.setVisible(visible)
         if not visible:
             return
 
@@ -581,6 +634,7 @@ class CommandWorkspacePanel(QWidget):
         self.read_only_lock = False
         self._definitions: dict[str, CommandDefinition] = {}
         self._readback_state_by_command: dict[str, dict[str, str]] = {}
+        self._verification_state_by_command: dict[str, WriteVerificationReport] = {}
 
         layout = QVBoxLayout(self)
         self.context_banner = QLabel()
@@ -700,6 +754,12 @@ class CommandWorkspacePanel(QWidget):
             )
             self.detail_widget.apply_prefill_values(prefill_values)
 
+    def set_verification_report(self, command_id: str, report: WriteVerificationReport) -> None:
+        normalized = str(command_id).upper()
+        self._verification_state_by_command[normalized] = report
+        if self.current_command_id() == normalized:
+            self.detail_widget.set_verification_report(report)
+
     def current_command(self) -> CommandDefinition:
         return self.detail_widget.definition
 
@@ -774,6 +834,7 @@ class CommandWorkspacePanel(QWidget):
         self.detail_widget.set_session_mode(self.session_mode)
         self.detail_widget.set_read_only_lock(self.read_only_lock)
         self._apply_readback_state(command_id)
+        self._apply_verification_state(command_id)
 
     def _apply_readback_state(self, command_id: str) -> None:
         state = self._readback_state_by_command.get(str(command_id).upper())
@@ -785,6 +846,10 @@ class CommandWorkspacePanel(QWidget):
             timestamp_text=state.get("timestamp_text", "--"),
             device_id=state.get("device_id", "--"),
         )
+
+    def _apply_verification_state(self, command_id: str) -> None:
+        report = self._verification_state_by_command.get(str(command_id).upper(), WriteVerificationReport())
+        self.detail_widget.set_verification_report(report)
 
     def _apply_filter(self, text: str) -> None:
         query = str(text or "").strip().lower()

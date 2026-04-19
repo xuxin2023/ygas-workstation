@@ -9,6 +9,7 @@ import re
 from typing import Any
 
 from ..config import COMMAND_TEMPLATE_PATH, DATA_DIR, OLD_COMMAND_TEMPLATE_PATH, ensure_runtime_dirs
+from ..models import StructuredValueSnapshot
 from ..protocols.profiles import get_profile
 from ..protocols.senco_format import normalize_senco_coefficient, normalize_senco_input
 from ..protocols.ygas import YGasProtocol
@@ -86,6 +87,16 @@ class CommandRegistry:
         "SENTEMP2": "temp_c",
         "AVERAGE1": "window",
         "AVERAGE2": "window",
+    }
+    SETTING_VALUE_COMPARE_LABELS = {
+        "FTD": "频率",
+        "SETPOW": "功率电压",
+        "SETCO2": "参考满值",
+        "TIMEOUT": "计数器",
+        "SENTEMP1": "CO2 标定温度",
+        "SENTEMP2": "H2O 标定温度",
+        "AVERAGE1": "H2O 滤波窗口",
+        "AVERAGE2": "CO2 滤波窗口",
     }
     WRITE_COMMAND_IDS = {
         "MODE",
@@ -266,6 +277,124 @@ class CommandRegistry:
             "current_value": f"当前值：{value}" if value else "--",
             "prefill_values": {key: value} if value else {},
         }
+
+    def build_target_snapshot(
+        self,
+        command_id: str,
+        values: dict[str, Any],
+        *,
+        profile_name: str = "bench_default",
+    ) -> StructuredValueSnapshot:
+        normalized = str(command_id or "").strip().upper()
+        definition = self.get(normalized, profile_name)
+        normalized_values = self.validate_parameters(definition, values)
+
+        if normalized == "ID":
+            new_id = str(normalized_values.get("new_id") or "").upper()
+            return StructuredValueSnapshot(
+                summary=f"目标设备 ID：{new_id}" if new_id else "--",
+                fields={"设备 ID": new_id} if new_id else {},
+            )
+        if normalized == "MODE":
+            mode = str(normalized_values.get("mode") or "").strip()
+            mode_text = f"MODE{mode}" if mode else "--"
+            return StructuredValueSnapshot(
+                summary=f"目标工作模式：{mode_text}" if mode else "--",
+                fields={"工作模式": mode_text} if mode else {},
+            )
+        if normalized == "SETCOM":
+            fields = {
+                "波特率": str(normalized_values.get("baudrate") or ""),
+                "数据位": str(normalized_values.get("bytesize") or ""),
+                "校验位": str(normalized_values.get("parity") or ""),
+                "停止位": str(normalized_values.get("stopbits") or ""),
+            }
+            summary = " / ".join(item for item in fields.values() if item) or "--"
+            return StructuredValueSnapshot(
+                summary=f"目标通信参数：{summary}" if summary != "--" else "--",
+                fields={key: value for key, value in fields.items() if value},
+            )
+        if normalized.startswith("SENCO"):
+            coeff_text = normalize_senco_input(str(normalized_values.get("coefficients") or ""))
+            coeff_fields = self._coefficient_fields_from_text(coeff_text)
+            return StructuredValueSnapshot(
+                summary=f"目标系数：{coeff_text}" if coeff_text else "--",
+                fields=coeff_fields,
+            )
+
+        field_label = self.SETTING_VALUE_COMPARE_LABELS.get(normalized)
+        field_key = self.SETTING_VALUE_PREFILL_KEYS.get(normalized)
+        raw_value = str(normalized_values.get(field_key or "") or "").strip()
+        display_value = self._normalize_scalar_for_compare(normalized, raw_value)
+        if not field_label:
+            return StructuredValueSnapshot(summary=display_value or "--", fields={})
+        return StructuredValueSnapshot(
+            summary=f"目标值：{display_value}" if display_value else "--",
+            fields={field_label: display_value} if display_value else {},
+        )
+
+    def build_readback_snapshot(
+        self,
+        command_id: str,
+        parsed_payload: dict[str, Any],
+        *,
+        profile_name: str = "bench_default",
+    ) -> StructuredValueSnapshot:
+        normalized = str(command_id or "").strip().upper()
+        payload = dict(parsed_payload or {})
+
+        if normalized == "ID":
+            device_id = str(payload.get("device_id") or "").upper()
+            return StructuredValueSnapshot(
+                summary=f"设备 ID：{device_id}" if device_id else "--",
+                fields={"设备 ID": device_id} if device_id else {},
+            )
+        if normalized == "MODE":
+            mode = str(payload.get("mode") or "").strip()
+            mode_text = f"MODE{mode}" if mode else "--"
+            return StructuredValueSnapshot(
+                summary=f"工作模式：{mode_text}" if mode else "--",
+                fields={"工作模式": mode_text} if mode else {},
+            )
+        if normalized == "SETCOM":
+            fields = {
+                "波特率": str(payload.get("baudrate") or ""),
+                "数据位": str(payload.get("bytesize") or ""),
+                "校验位": str(payload.get("parity") or ""),
+                "停止位": str(payload.get("stopbits") or ""),
+            }
+            summary = " / ".join(item for item in fields.values() if item) or "--"
+            return StructuredValueSnapshot(
+                summary=f"通信参数：{summary}" if summary != "--" else "--",
+                fields={key: value for key, value in fields.items() if value},
+            )
+        if normalized.startswith("SENCO"):
+            coeff_text = self._normalized_coefficients_from_payload(payload)
+            return StructuredValueSnapshot(
+                summary=f"系数：{coeff_text}" if coeff_text else "--",
+                fields=self._coefficient_fields_from_text(coeff_text),
+            )
+
+        field_label = self.SETTING_VALUE_COMPARE_LABELS.get(normalized)
+        value_text = self._normalize_scalar_for_compare(normalized, str(payload.get("value") or "").strip())
+        if not field_label:
+            return StructuredValueSnapshot(summary=value_text or "--", fields={})
+        return StructuredValueSnapshot(
+            summary=f"当前值：{value_text}" if value_text else "--",
+            fields={field_label: value_text} if value_text else {},
+        )
+
+    def diff_structured_snapshots(
+        self,
+        expected: StructuredValueSnapshot,
+        actual: StructuredValueSnapshot,
+    ) -> list[str]:
+        all_keys = sorted(set(expected.fields) | set(actual.fields))
+        mismatches: list[str] = []
+        for key in all_keys:
+            if str(expected.fields.get(key, "")).strip() != str(actual.fields.get(key, "")).strip():
+                mismatches.append(key)
+        return mismatches
 
     @classmethod
     def is_write_command_id(cls, command_id: str) -> bool:
@@ -1032,3 +1161,22 @@ class CommandRegistry:
         for _, value in ordered_items[:6]:
             normalized.append(normalize_senco_coefficient(str(value)))
         return ",".join(normalized)
+
+    def _coefficient_fields_from_text(self, coeff_text: str) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        for index, item in enumerate(part.strip() for part in coeff_text.split(",") if part.strip()):
+            fields[f"C{index}"] = item
+        return fields
+
+    def _normalize_scalar_for_compare(self, command_id: str, value: str) -> str:
+        normalized = str(command_id or "").strip().upper()
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if normalized in {"ID", "SETCOM"}:
+            return text.upper() if normalized == "ID" else text
+        try:
+            numeric = float(text)
+        except ValueError:
+            return text
+        return f"{numeric:g}"

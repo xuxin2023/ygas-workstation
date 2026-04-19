@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication, QLineEdit, QMessageBox, QToolBar, QT
 from unittest import mock
 
 from ygas_monitor.commanding.registry import CommandRegistry
+from ygas_monitor.commanding.safety import SESSION_MODE_ENGINEERING, SESSION_MODE_LISTEN_ONLY
 from ygas_monitor.models import CommandResult, ParsedFrame
 from ygas_monitor.services.settings_service import SettingsService
 from ygas_monitor.ui.main_window import MainWindow
@@ -25,6 +26,18 @@ class SessionUiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
+
+    def _prepare_write_ready_widget(self, name: str) -> SessionWidget:
+        widget = SessionWidget(name)
+        widget.connected = True
+        widget.permission_combo.setCurrentText("CALIBRATION")
+        engineering_index = widget.session_mode_combo.findData(SESSION_MODE_ENGINEERING)
+        widget.session_mode_combo.setCurrentIndex(engineering_index)
+        widget.target_combo.setCurrentText("012")
+        widget._handle_rx_device_state({"latest_rx_device_id": "012", "active_rx_device_ids": ["012"]})
+        widget._apply_permission_mode()
+        self.app.processEvents()
+        return widget
 
     def test_monitor_cards_fill_twelve_slots_and_include_latest_data_delay(self) -> None:
         widget = SessionWidget("ui-test")
@@ -166,6 +179,90 @@ class SessionUiTests(unittest.TestCase):
             self.assertFalse(panel.context_risk_label.isHidden())
         finally:
             panel.close()
+            self.app.processEvents()
+
+    def test_hard_status_bar_shows_write_ready_context(self) -> None:
+        widget = self._prepare_write_ready_widget("ui-hard-status-ready")
+        try:
+            widget._update_hard_status_bar()
+
+            self.assertEqual(widget.hard_online_value_label.parentWidget().title(), "会话写入基础状态")
+            self.assertEqual(widget.hard_online_value_label.text(), "012")
+            self.assertEqual(widget.hard_target_value_label.text(), "012")
+            self.assertEqual(widget.hard_send_value_label.text(), "FFF")
+            self.assertEqual(widget.hard_write_permission_label.text(), "允许")
+            self.assertIn("已满足写入条件", widget.hard_reason_value_label.text())
+            self.assertIn("基础写入条件", widget.hard_status_help_label.text())
+            self.assertIn("具体命令仍需通过权限、风险和命令级校验", widget.hard_status_help_label.text())
+            self.assertEqual(widget.hard_status_note_label.text(), "当前选中命令仍会单独校验")
+        finally:
+            widget.shutdown()
+            widget.close()
+            self.app.processEvents()
+
+    def test_hard_status_bar_blocks_mismatch_and_multiple_online_devices(self) -> None:
+        widget = self._prepare_write_ready_widget("ui-hard-status-blocked")
+        try:
+            widget._handle_rx_device_state({"latest_rx_device_id": "002", "active_rx_device_ids": ["002"]})
+            widget._update_hard_status_bar()
+            self.assertEqual(widget.hard_write_permission_label.text(), "禁止")
+            self.assertIn("target-online 不一致", widget.hard_reason_value_label.text())
+
+            widget._handle_rx_device_state({"latest_rx_device_id": "002", "active_rx_device_ids": ["002", "003"]})
+            widget._update_hard_status_bar()
+            self.assertEqual(widget.hard_online_value_label.text(), "多个")
+            self.assertIn("当前无唯一在线设备", widget.hard_reason_value_label.text())
+        finally:
+            widget.shutdown()
+            widget.close()
+            self.app.processEvents()
+
+    def test_hard_status_bar_reflects_listen_lock_and_replay_states(self) -> None:
+        widget = self._prepare_write_ready_widget("ui-hard-status-modes")
+        try:
+            listen_index = widget.session_mode_combo.findData(SESSION_MODE_LISTEN_ONLY)
+            widget.session_mode_combo.setCurrentIndex(listen_index)
+            widget._apply_permission_mode()
+            self.assertIn("只监听模式", widget.hard_reason_value_label.text())
+
+            engineering_index = widget.session_mode_combo.findData(SESSION_MODE_ENGINEERING)
+            widget.session_mode_combo.setCurrentIndex(engineering_index)
+            widget.read_only_lock_check.setChecked(True)
+            widget._apply_permission_mode()
+            self.assertIn("只读锁开启", widget.hard_reason_value_label.text())
+
+            widget.read_only_lock_check.setChecked(False)
+            widget.replay_running = True
+            widget._apply_permission_mode()
+            self.assertIn("回放模式", widget.hard_reason_value_label.text())
+        finally:
+            widget.shutdown()
+            widget.close()
+            self.app.processEvents()
+
+    def test_chart_config_actions_are_visible_and_update_slot_summary(self) -> None:
+        widget = SessionWidget("ui-chart-config")
+        try:
+            widget.show()
+            self.app.processEvents()
+
+            self.assertTrue(widget.chart_config_group.isVisible())
+            self.assertIn("CO2 浓度", widget.chart_upper_summary_label.text())
+            self.assertIn("H2O 浓度", widget.chart_lower_summary_label.text())
+
+            widget.chart_view_combo.setCurrentIndex(widget.chart_view_combo.findData("temperature"))
+            widget._apply_chart_view_to_slot(0)
+            self.assertIn("腔温", widget.chart_upper_summary_label.text())
+
+            widget._clear_chart_slot(1)
+            self.assertEqual(widget.chart_lower_summary_label.text(), "未配置")
+
+            widget._restore_chart_defaults()
+            self.assertIn("CO2 浓度", widget.chart_upper_summary_label.text())
+            self.assertIn("H2O 浓度", widget.chart_lower_summary_label.text())
+        finally:
+            widget.shutdown()
+            widget.close()
             self.app.processEvents()
 
     def test_senco_preview_uses_fff_and_normalized_coefficients(self) -> None:
@@ -390,6 +487,149 @@ class SessionUiTests(unittest.TestCase):
             widget.close()
             self.app.processEvents()
 
+    def test_write_verification_runs_pre_read_write_post_read_sequence(self) -> None:
+        widget = self._prepare_write_ready_widget("ui-write-verify-sequence")
+        try:
+            widget.control_panel.select_command("MODE")
+            definition = widget.registry.get("MODE")
+            detail = widget.control_panel.detail_widget
+
+            with (
+                mock.patch.object(widget, "_confirm_high_risk_command", return_value=True),
+                mock.patch.object(widget.controller, "update_config"),
+                mock.patch.object(widget.controller, "send_payload") as send_payload,
+            ):
+                widget._handle_command_request(definition, {"mode": "2"}, "MODE,YGAS,FFF,2", "FFF")
+                self.assertEqual(send_payload.call_args_list[0].args[0], "MODE,YGAS,012")
+                self.assertEqual(send_payload.call_args_list[0].kwargs["expectation"], "mode_value")
+                self.assertIn("写前读取中", detail.verify_result_label.text())
+
+                widget._handle_command_result(
+                    CommandResult(
+                        timestamp=datetime(2026, 4, 19, 10, 50, 0),
+                        command="MODE,YGAS,012",
+                        ok=True,
+                        message="当前工作模式: MODE1",
+                        response_kind="mode_value",
+                        response_device_id="012",
+                        parsed_payload={"device_id": "012", "mode": 1},
+                    )
+                )
+                self.assertEqual(send_payload.call_args_list[1].args[0], "MODE,YGAS,FFF,2")
+
+                widget._handle_command_result(
+                    CommandResult(
+                        timestamp=datetime(2026, 4, 19, 10, 50, 1),
+                        command="MODE,YGAS,FFF,2",
+                        ok=True,
+                        message="ACK 成功",
+                    )
+                )
+                self.assertEqual(send_payload.call_args_list[2].args[0], "MODE,YGAS,012")
+
+                widget._handle_command_result(
+                    CommandResult(
+                        timestamp=datetime(2026, 4, 19, 10, 50, 2),
+                        command="MODE,YGAS,012",
+                        ok=True,
+                        message="当前工作模式: MODE2",
+                        response_kind="mode_value",
+                        response_device_id="012",
+                        parsed_payload={"device_id": "012", "mode": 2},
+                    )
+                )
+
+            self.assertIn("MODE1", detail.verify_before_label.text())
+            self.assertIn("MODE2", detail.verify_target_label.text())
+            self.assertIn("MODE2", detail.verify_after_label.text())
+            self.assertEqual(detail.verify_result_label.text(), "一致")
+            self.assertEqual(detail.verify_device_label.text(), "012")
+        finally:
+            widget.shutdown()
+            widget.close()
+            self.app.processEvents()
+
+    def test_write_verification_marks_mismatch_and_unverifiable_results(self) -> None:
+        widget = self._prepare_write_ready_widget("ui-write-verify-states")
+        try:
+            widget.control_panel.select_command("MODE")
+            definition = widget.registry.get("MODE")
+            detail = widget.control_panel.detail_widget
+
+            with (
+                mock.patch.object(widget, "_confirm_high_risk_command", return_value=True),
+                mock.patch.object(widget.controller, "update_config"),
+                mock.patch.object(widget.controller, "send_payload"),
+            ):
+                widget._handle_command_request(definition, {"mode": "2"}, "MODE,YGAS,FFF,2", "FFF")
+                widget._handle_command_result(
+                    CommandResult(
+                        timestamp=datetime(2026, 4, 19, 10, 55, 0),
+                        command="MODE,YGAS,012",
+                        ok=True,
+                        message="当前工作模式: MODE1",
+                        response_kind="mode_value",
+                        response_device_id="012",
+                        parsed_payload={"device_id": "012", "mode": 1},
+                    )
+                )
+                widget._handle_command_result(
+                    CommandResult(
+                        timestamp=datetime(2026, 4, 19, 10, 55, 1),
+                        command="MODE,YGAS,FFF,2",
+                        ok=True,
+                        message="ACK 成功",
+                    )
+                )
+                widget._handle_command_result(
+                    CommandResult(
+                        timestamp=datetime(2026, 4, 19, 10, 55, 2),
+                        command="MODE,YGAS,012",
+                        ok=True,
+                        message="当前工作模式: MODE3",
+                        response_kind="mode_value",
+                        response_device_id="012",
+                        parsed_payload={"device_id": "012", "mode": 3},
+                    )
+                )
+                self.assertEqual(detail.verify_result_label.text(), "不一致")
+                self.assertIn("工作模式", detail.verify_detail_label.text())
+
+                widget._handle_command_request(definition, {"mode": "2"}, "MODE,YGAS,FFF,2", "FFF")
+                widget._handle_command_result(
+                    CommandResult(
+                        timestamp=datetime(2026, 4, 19, 10, 56, 0),
+                        command="MODE,YGAS,012",
+                        ok=True,
+                        message="当前工作模式: MODE1",
+                        response_kind="mode_value",
+                        response_device_id="012",
+                        parsed_payload={"device_id": "012", "mode": 1},
+                    )
+                )
+                widget._handle_command_result(
+                    CommandResult(
+                        timestamp=datetime(2026, 4, 19, 10, 56, 1),
+                        command="MODE,YGAS,FFF,2",
+                        ok=True,
+                        message="ACK 成功",
+                    )
+                )
+                widget._handle_command_result(
+                    CommandResult(
+                        timestamp=datetime(2026, 4, 19, 10, 56, 2),
+                        command="MODE,YGAS,012",
+                        ok=False,
+                        message="命令超时，未在 2000 ms 内收到预期响应。",
+                    )
+                )
+                self.assertEqual(detail.verify_result_label.text(), "无法验证")
+                self.assertIn("写后读取失败", detail.verify_detail_label.text())
+        finally:
+            widget.shutdown()
+            widget.close()
+            self.app.processEvents()
+
     def test_write_command_is_blocked_when_online_device_mismatches_target(self) -> None:
         widget = SessionWidget("ui-target-mismatch")
         try:
@@ -431,11 +671,22 @@ class SessionUiTests(unittest.TestCase):
                 mock.patch.object(QMessageBox, "warning") as warning,
             ):
                 widget._handle_command_request(definition, {"mode": "2"}, "MODE,YGAS,FFF,2", "FFF")
+                widget._handle_command_result(
+                    CommandResult(
+                        timestamp=datetime(2026, 4, 19, 10, 40, 0),
+                        command="MODE,YGAS,012",
+                        ok=True,
+                        message="当前工作模式: MODE1",
+                        response_kind="mode_value",
+                        response_device_id="012",
+                        parsed_payload={"device_id": "012", "mode": 1},
+                    )
+                )
 
             warning.assert_not_called()
             update_config.assert_called_once()
-            send_payload.assert_called_once()
-            self.assertEqual(send_payload.call_args.args[0], "MODE,YGAS,FFF,2")
+            self.assertEqual(send_payload.call_args_list[0].args[0], "MODE,YGAS,012")
+            self.assertEqual(send_payload.call_args_list[1].args[0], "MODE,YGAS,FFF,2")
         finally:
             widget.shutdown()
             widget.close()

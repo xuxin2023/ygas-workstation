@@ -94,3 +94,29 @@ class CommandResult:
     response_kind: str = ""
     response_device_id: str | None = None
     parsed_payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class StructuredValueSnapshot:
+    summary: str = "--"
+    fields: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class WriteVerificationReport:
+    before: StructuredValueSnapshot = field(default_factory=StructuredValueSnapshot)
+    target: StructuredValueSnapshot = field(default_factory=StructuredValueSnapshot)
+    after: StructuredValueSnapshot = field(default_factory=StructuredValueSnapshot)
+    result_text: str = "--"
+    detail_text: str = "--"
+    verified_at: datetime | None = None
+    source_device_id: str | None = None
+
+
+@dataclass(slots=True)
+class SessionWriteStatus:
+    online_device_text: str = "--"
+    session_target_text: str = "--"
+    effective_send_text: str = "--"
+    write_allowed: bool = False
+    reason_text: str = "--"
