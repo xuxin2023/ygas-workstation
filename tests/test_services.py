@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 import time
 
+from ygas_monitor.commanding.safety import SESSION_MODE_SAFE_HANDSHAKE
 from ygas_monitor.models import ParsedFrame, RawFrameRecord, SerialSettings, SessionConfig
 from ygas_monitor.services.export_service import export_session_package
 from ygas_monitor.services.replay_service import load_replay_dataset, validate_replay_headers
@@ -60,6 +61,15 @@ def make_mode2_frame(device_id: str) -> str:
 
 
 class SettingsServiceTests(unittest.TestCase):
+    def test_default_session_settings_use_safe_onboarding_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = SettingsService(Path(temp_dir) / "settings.json")
+            loaded = service.load()
+
+        self.assertEqual(loaded["session"]["permission_level"], "READ_ONLY")
+        self.assertEqual(loaded["session"]["session_mode"], SESSION_MODE_SAFE_HANDSHAKE)
+        self.assertTrue(loaded["session"]["read_only_lock"])
+
     def test_settings_roundtrip_preserves_recent_connection_values(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = SettingsService(Path(temp_dir) / "settings.json")

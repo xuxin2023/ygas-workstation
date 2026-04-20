@@ -114,6 +114,18 @@ class WriteVerificationReport:
 
 
 @dataclass(slots=True)
+class SessionChangeEntry:
+    timestamp: datetime
+    command_name: str
+    target_device_id: str
+    before_value: str = "--"
+    target_value: str = "--"
+    after_value: str = "--"
+    result_text: str = "--"
+    detail_text: str = "--"
+
+
+@dataclass(slots=True)
 class SessionWriteStatus:
     online_device_text: str = "--"
     session_target_text: str = "--"
