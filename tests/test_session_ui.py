@@ -13,8 +13,12 @@ from PySide6.QtWidgets import QApplication, QLineEdit, QMessageBox, QToolBar, QT
 from unittest import mock
 
 from ygas_monitor.commanding.registry import CommandRegistry
-from ygas_monitor.commanding.safety import SESSION_MODE_ENGINEERING, SESSION_MODE_LISTEN_ONLY
-from ygas_monitor.models import CommandResult, ParsedFrame
+from ygas_monitor.commanding.safety import (
+    SESSION_MODE_ENGINEERING,
+    SESSION_MODE_LISTEN_ONLY,
+    SESSION_MODE_SAFE_HANDSHAKE,
+)
+from ygas_monitor.models import CommandResult, ParsedFrame, StructuredValueSnapshot, WriteVerificationReport
 from ygas_monitor.services.settings_service import SettingsService
 from ygas_monitor.ui.main_window import MainWindow
 from ygas_monitor.ui.product_dialogs import _load_help_markdown
@@ -33,11 +37,40 @@ class SessionUiTests(unittest.TestCase):
         widget.permission_combo.setCurrentText("CALIBRATION")
         engineering_index = widget.session_mode_combo.findData(SESSION_MODE_ENGINEERING)
         widget.session_mode_combo.setCurrentIndex(engineering_index)
+        widget.read_only_lock_check.setChecked(False)
         widget.target_combo.setCurrentText("012")
         widget._handle_rx_device_state({"latest_rx_device_id": "012", "active_rx_device_ids": ["012"]})
         widget._apply_permission_mode()
         self.app.processEvents()
         return widget
+
+    @staticmethod
+    def _table_text(widget: SessionWidget, row: int, column: int) -> str:
+        item = widget.change_overview_table.item(row, column)
+        return item.text() if item is not None else ""
+
+    @staticmethod
+    def _record_change_entry(
+        widget: SessionWidget,
+        command_id: str,
+        result_text: str,
+        *,
+        target_device_id: str = "012",
+        before_value: str = "--",
+        target_value: str = "--",
+        after_value: str = "--",
+        detail_text: str | None = None,
+    ) -> None:
+        report = WriteVerificationReport(
+            before=StructuredValueSnapshot(summary=before_value),
+            target=StructuredValueSnapshot(summary=target_value),
+            after=StructuredValueSnapshot(summary=after_value),
+            result_text=result_text,
+            detail_text=detail_text or result_text,
+            verified_at=datetime(2026, 4, 19, 11, 0, 0),
+            source_device_id=target_device_id,
+        )
+        widget._record_session_change(command_id, report, target_device_id=target_device_id)
 
     def test_monitor_cards_fill_twelve_slots_and_include_latest_data_delay(self) -> None:
         widget = SessionWidget("ui-test")
@@ -235,6 +268,201 @@ class SessionUiTests(unittest.TestCase):
             widget.replay_running = True
             widget._apply_permission_mode()
             self.assertIn("回放模式", widget.hard_reason_value_label.text())
+        finally:
+            widget.shutdown()
+            widget.close()
+            self.app.processEvents()
+
+    def test_new_session_defaults_to_safe_onboarding_state(self) -> None:
+        widget = SessionWidget("ui-safe-onboarding-defaults")
+        try:
+            self.assertEqual(widget.permission_combo.currentText(), "READ_ONLY")
+            self.assertEqual(widget.session_mode_combo.currentData(), SESSION_MODE_SAFE_HANDSHAKE)
+            self.assertTrue(widget.read_only_lock_check.isChecked())
+            self.assertFalse(widget.broadcast_check.isChecked())
+            self.assertIn("当前为安全接入模式", widget.session_safety_hint_label.text())
+            self.assertIn("工程模式", widget.session_safety_hint_detail_label.text())
+        finally:
+            widget.shutdown()
+            widget.close()
+            self.app.processEvents()
+
+    def test_persisted_session_state_is_not_overridden_by_safe_defaults(self) -> None:
+        widget = SessionWidget(
+            "ui-safe-onboarding-persisted",
+            initial_state={
+                "permission_level": "CALIBRATION",
+                "session_mode": SESSION_MODE_ENGINEERING,
+                "read_only_lock": False,
+                "target_id": "012",
+            },
+        )
+        try:
+            self.assertEqual(widget.permission_combo.currentText(), "CALIBRATION")
+            self.assertEqual(widget.session_mode_combo.currentData(), SESSION_MODE_ENGINEERING)
+            self.assertFalse(widget.read_only_lock_check.isChecked())
+            self.assertEqual(widget.target_combo.currentText(), "012")
+            self.assertIn("已离开默认安全接入状态", widget.session_safety_hint_label.text())
+        finally:
+            widget.shutdown()
+            widget.close()
+            self.app.processEvents()
+
+    def test_task_entry_area_is_visible_and_routes_without_sending_commands(self) -> None:
+        widget = SessionWidget("ui-task-entries")
+        try:
+            widget.show()
+            self.app.processEvents()
+
+            self.assertTrue(widget.task_new_device_button.isVisible())
+            self.assertEqual(widget.task_new_device_button_label.text(), "新设备接入检查")
+            self.assertIn("先确认连接", widget.task_new_device_button_description.text())
+            self.assertEqual(widget.task_export_diag_button_label.text(), "导出诊断包")
+            self.assertTrue(widget.task_new_device_status_label.isVisible())
+            self.assertTrue(widget.task_read_snapshot_status_label.isVisible())
+            self.assertTrue(widget.task_address_mode_status_label.isVisible())
+            self.assertTrue(widget.task_coeff_review_status_label.isVisible())
+            self.assertTrue(widget.task_export_diag_status_label.isVisible())
+            self.assertEqual(widget.task_new_device_status_title_label.text(), "当前状态")
+            self.assertEqual(widget.task_read_snapshot_status_title_label.text(), "当前状态")
+            self.assertEqual(widget.task_address_mode_status_title_label.text(), "当前状态")
+            self.assertEqual(widget.task_coeff_review_status_title_label.text(), "当前状态")
+            self.assertEqual(widget.task_export_diag_status_title_label.text(), "当前状态")
+            self.assertIn("不会自动发送危险写命令", widget.task_entry_feedback_label.text())
+
+            with mock.patch.object(widget.controller, "send_payload") as send_payload:
+                widget.task_new_device_button.click()
+                self.assertEqual(widget.pages.currentIndex(), widget.settings_tab_index)
+
+                widget.task_read_snapshot_button.click()
+                self.assertEqual(widget.pages.currentIndex(), widget.control_tab_index)
+
+                widget.task_address_mode_button.click()
+                self.assertEqual(widget.pages.currentIndex(), widget.control_tab_index)
+
+                widget.task_coeff_review_button.click()
+                self.assertEqual(widget.pages.currentIndex(), widget.coeff_tab_index)
+
+                widget.task_export_diag_button.click()
+                self.assertEqual(widget.pages.currentIndex(), widget.export_tab_index)
+
+            send_payload.assert_not_called()
+            self.assertIn("本次参数变更总览", widget.task_entry_feedback_label.text())
+        finally:
+            widget.shutdown()
+            widget.close()
+            self.app.processEvents()
+
+    def test_task_entry_states_follow_session_context(self) -> None:
+        widget = SessionWidget("ui-task-state-context")
+        try:
+            widget.show()
+            self.app.processEvents()
+
+            self.assertEqual(widget.task_new_device_status_label.text(), "未连接")
+            self.assertEqual(widget.task_read_snapshot_status_label.text(), "尚未读取")
+            self.assertIn("当前目标：001", widget.task_address_mode_status_label.text())
+            self.assertEqual(widget.task_coeff_review_status_label.text(), "尚未执行")
+            self.assertEqual(widget.task_export_diag_status_label.text(), "本次会话暂无参数变更")
+
+            widget.connected = True
+            widget._refresh_task_entry_states()
+            self.assertEqual(widget.task_new_device_status_label.text(), "已连接，待识别设备")
+
+            widget.target_combo.setCurrentText("012")
+            widget._handle_rx_device_state({"latest_rx_device_id": "012", "active_rx_device_ids": ["012"]})
+            self.assertEqual(widget.task_new_device_status_label.text(), "已识别唯一在线设备：012")
+
+            widget._handle_rx_device_state({"latest_rx_device_id": "002", "active_rx_device_ids": ["002"]})
+            self.assertEqual(widget.task_new_device_status_label.text(), "target/online 不一致")
+
+            widget._handle_rx_device_state({"latest_rx_device_id": "002", "active_rx_device_ids": ["002", "003"]})
+            self.assertEqual(widget.task_new_device_status_label.text(), "多个在线设备，需先收敛")
+
+            widget._pending_readback_requests["MODE,YGAS,012"] = {
+                "command_id": "MODE",
+                "phase": "manual",
+                "profile_name": widget._current_profile_name(),
+            }
+            widget._handle_command_result(
+                CommandResult(
+                    timestamp=datetime(2026, 4, 19, 11, 5, 0),
+                    command="MODE,YGAS,012",
+                    ok=True,
+                    message="当前工作模式: MODE1",
+                    response_kind="mode_value",
+                    response_device_id="012",
+                    parsed_payload={"device_id": "012", "mode": 1},
+                )
+            )
+            self.assertIn("最近已读取", widget.task_read_snapshot_status_label.text())
+            self.assertIn("设备 012", widget.task_read_snapshot_status_label.text())
+            self.assertIn("当前模式：MODE1", widget.task_address_mode_status_label.text())
+
+            widget._pending_readback_requests["ID,YGAS,012"] = {
+                "command_id": "ID",
+                "phase": "manual",
+                "profile_name": widget._current_profile_name(),
+            }
+            widget._handle_command_result(
+                CommandResult(
+                    timestamp=datetime(2026, 4, 19, 11, 6, 0),
+                    command="ID,YGAS,012",
+                    ok=False,
+                    message="命令超时，未在 2000 ms 内收到预期响应。",
+                )
+            )
+            self.assertIn("最近读取失败", widget.task_read_snapshot_status_label.text())
+
+            self._record_change_entry(widget, "SENCO1", "一致", before_value="A", target_value="B", after_value="B")
+            self.assertEqual(widget.task_coeff_review_status_label.text(), "最近一次复核一致")
+            self.assertIn("1 条参数变更待导出", widget.task_export_diag_status_label.text())
+
+            self._record_change_entry(widget, "SENCO1", "写入失败", detail_text="设备拒绝写入")
+            self.assertEqual(widget.task_coeff_review_status_label.text(), "最近一次写入失败")
+            self.assertIn("2 条参数变更待导出", widget.task_export_diag_status_label.text())
+        finally:
+            widget.shutdown()
+            widget.close()
+            self.app.processEvents()
+
+    def test_change_summary_box_tracks_counts_and_routes_to_overview(self) -> None:
+        widget = SessionWidget("ui-change-summary")
+        try:
+            widget.show()
+            self.app.processEvents()
+
+            self.assertEqual(widget.change_summary_message_label.parentWidget().title(), "参数变更总览摘要")
+            self.assertTrue(widget.change_summary_view_button.isVisible())
+            self.assertEqual(widget.change_summary_message_label.text(), "本次会话暂无参数变更")
+            self.assertEqual(widget.change_summary_view_button.text(), "查看总览")
+            self.assertEqual(widget.change_summary_total_value_label.text(), "0")
+            self.assertEqual(widget.change_summary_total_value_label.parentWidget().layout().itemAtPosition(1, 0).widget().text(), "总数")
+            self.assertEqual(widget.change_summary_consistent_value_label.parentWidget().layout().itemAtPosition(1, 1).widget().text(), "一致")
+            self.assertEqual(widget.change_summary_mismatch_value_label.parentWidget().layout().itemAtPosition(1, 2).widget().text(), "不一致")
+            self.assertEqual(widget.change_summary_unverifiable_value_label.parentWidget().layout().itemAtPosition(1, 3).widget().text(), "无法验证")
+            self.assertEqual(widget.change_summary_failure_value_label.parentWidget().layout().itemAtPosition(1, 4).widget().text(), "失败类")
+
+            self._record_change_entry(widget, "MODE", "一致", before_value="MODE1", target_value="MODE2", after_value="MODE2")
+            self._record_change_entry(widget, "MODE", "不一致", before_value="MODE1", target_value="MODE2", after_value="MODE3")
+            self._record_change_entry(widget, "MODE", "无法验证")
+            self._record_change_entry(widget, "MODE", "写入失败")
+            self._record_change_entry(widget, "MODE", "写前读取失败")
+
+            self.assertEqual(widget.change_summary_total_value_label.text(), "5")
+            self.assertEqual(widget.change_summary_consistent_value_label.text(), "1")
+            self.assertEqual(widget.change_summary_mismatch_value_label.text(), "1")
+            self.assertEqual(widget.change_summary_unverifiable_value_label.text(), "1")
+            self.assertEqual(widget.change_summary_failure_value_label.text(), "2")
+            self.assertIn("5 条参数变更", widget.change_summary_message_label.text())
+            self.assertEqual(widget.change_overview_table.rowCount(), 5)
+
+            with mock.patch.object(widget.controller, "send_payload") as send_payload:
+                widget.change_summary_view_button.click()
+                self.app.processEvents()
+                self.assertEqual(widget.pages.currentIndex(), widget.export_tab_index)
+                self.assertIn("本次参数变更总览", widget.task_entry_feedback_label.text())
+            send_payload.assert_not_called()
         finally:
             widget.shutdown()
             widget.close()
@@ -544,6 +772,13 @@ class SessionUiTests(unittest.TestCase):
             self.assertIn("MODE2", detail.verify_after_label.text())
             self.assertEqual(detail.verify_result_label.text(), "一致")
             self.assertEqual(detail.verify_device_label.text(), "012")
+            self.assertEqual(widget.change_overview_table.rowCount(), 1)
+            self.assertEqual(self._table_text(widget, 0, 1), "设置工作模式")
+            self.assertEqual(self._table_text(widget, 0, 2), "012")
+            self.assertIn("MODE1", self._table_text(widget, 0, 3))
+            self.assertIn("MODE2", self._table_text(widget, 0, 4))
+            self.assertIn("MODE2", self._table_text(widget, 0, 5))
+            self.assertEqual(self._table_text(widget, 0, 6), "一致")
         finally:
             widget.shutdown()
             widget.close()
@@ -594,6 +829,8 @@ class SessionUiTests(unittest.TestCase):
                 )
                 self.assertEqual(detail.verify_result_label.text(), "不一致")
                 self.assertIn("工作模式", detail.verify_detail_label.text())
+                self.assertEqual(widget.change_overview_table.rowCount(), 1)
+                self.assertEqual(self._table_text(widget, 0, 6), "不一致")
 
                 widget._handle_command_request(definition, {"mode": "2"}, "MODE,YGAS,FFF,2", "FFF")
                 widget._handle_command_result(
@@ -625,6 +862,62 @@ class SessionUiTests(unittest.TestCase):
                 )
                 self.assertEqual(detail.verify_result_label.text(), "无法验证")
                 self.assertIn("写后读取失败", detail.verify_detail_label.text())
+                self.assertEqual(widget.change_overview_table.rowCount(), 2)
+                self.assertEqual(self._table_text(widget, 0, 6), "无法验证")
+        finally:
+            widget.shutdown()
+            widget.close()
+            self.app.processEvents()
+
+    def test_change_overview_records_write_failure_and_pre_read_failure(self) -> None:
+        widget = self._prepare_write_ready_widget("ui-write-verify-overview-failures")
+        try:
+            widget.control_panel.select_command("MODE")
+            definition = widget.registry.get("MODE")
+            detail = widget.control_panel.detail_widget
+
+            with (
+                mock.patch.object(widget, "_confirm_high_risk_command", return_value=True),
+                mock.patch.object(widget.controller, "update_config"),
+                mock.patch.object(widget.controller, "send_payload"),
+            ):
+                widget._handle_command_request(definition, {"mode": "2"}, "MODE,YGAS,FFF,2", "FFF")
+                widget._handle_command_result(
+                    CommandResult(
+                        timestamp=datetime(2026, 4, 19, 10, 57, 0),
+                        command="MODE,YGAS,012",
+                        ok=False,
+                        message="命令超时，未在 2000 ms 内收到预期响应。",
+                    )
+                )
+                self.assertEqual(detail.verify_result_label.text(), "写前读取失败")
+                self.assertEqual(widget.change_overview_table.rowCount(), 1)
+                self.assertEqual(self._table_text(widget, 0, 6), "写前读取失败")
+
+                widget._handle_command_request(definition, {"mode": "2"}, "MODE,YGAS,FFF,2", "FFF")
+                widget._handle_command_result(
+                    CommandResult(
+                        timestamp=datetime(2026, 4, 19, 10, 58, 0),
+                        command="MODE,YGAS,012",
+                        ok=True,
+                        message="当前工作模式: MODE1",
+                        response_kind="mode_value",
+                        response_device_id="012",
+                        parsed_payload={"device_id": "012", "mode": 1},
+                    )
+                )
+                widget._handle_command_result(
+                    CommandResult(
+                        timestamp=datetime(2026, 4, 19, 10, 58, 1),
+                        command="MODE,YGAS,FFF,2",
+                        ok=False,
+                        message="设备拒绝写入",
+                    )
+                )
+                self.assertEqual(detail.verify_result_label.text(), "写入失败")
+                self.assertEqual(widget.change_overview_table.rowCount(), 2)
+                self.assertEqual(self._table_text(widget, 0, 6), "写入失败")
+                self.assertIn("设备拒绝写入", self._table_text(widget, 0, 7))
         finally:
             widget.shutdown()
             widget.close()
@@ -635,6 +928,8 @@ class SessionUiTests(unittest.TestCase):
         try:
             widget.connected = True
             widget.permission_combo.setCurrentText("CALIBRATION")
+            widget.read_only_lock_check.setChecked(False)
+            widget.session_mode_combo.setCurrentIndex(widget.session_mode_combo.findData(SESSION_MODE_ENGINEERING))
             widget.target_combo.setCurrentText("012")
             widget._handle_rx_device_state(
                 {"latest_rx_device_id": "002", "active_rx_device_ids": ["002"]}
@@ -658,6 +953,8 @@ class SessionUiTests(unittest.TestCase):
         try:
             widget.connected = True
             widget.permission_combo.setCurrentText("CALIBRATION")
+            widget.read_only_lock_check.setChecked(False)
+            widget.session_mode_combo.setCurrentIndex(widget.session_mode_combo.findData(SESSION_MODE_ENGINEERING))
             widget.target_combo.setCurrentText("012")
             widget._handle_rx_device_state(
                 {"latest_rx_device_id": "012", "active_rx_device_ids": ["012"]}
@@ -697,6 +994,8 @@ class SessionUiTests(unittest.TestCase):
         try:
             widget.connected = True
             widget.permission_combo.setCurrentText("CALIBRATION")
+            widget.read_only_lock_check.setChecked(False)
+            widget.session_mode_combo.setCurrentIndex(widget.session_mode_combo.findData(SESSION_MODE_ENGINEERING))
             widget.target_combo.setCurrentText("012")
             widget._handle_rx_device_state(
                 {"latest_rx_device_id": "", "active_rx_device_ids": []}
@@ -719,6 +1018,8 @@ class SessionUiTests(unittest.TestCase):
         try:
             widget.connected = True
             widget.permission_combo.setCurrentText("CALIBRATION")
+            widget.read_only_lock_check.setChecked(False)
+            widget.session_mode_combo.setCurrentIndex(widget.session_mode_combo.findData(SESSION_MODE_ENGINEERING))
             widget.target_combo.setCurrentText("012")
             widget._handle_rx_device_state(
                 {"latest_rx_device_id": "002", "active_rx_device_ids": ["002", "003"]}

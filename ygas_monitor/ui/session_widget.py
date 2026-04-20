@@ -28,6 +28,8 @@ from PySide6.QtWidgets import (
     QSlider,
     QSplitter,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -49,6 +51,7 @@ from ..models import (
     CommandResult,
     ParsedFrame,
     RawFrameRecord,
+    SessionChangeEntry,
     SessionConfig,
     SerialSettings,
     SessionWriteStatus,
@@ -152,6 +155,7 @@ class SessionWidget(QWidget):
         self._device_action_active: dict[str, object] | None = None
         self._default_config_scheduled = False
         self._device_output_mode = "MODE2"
+        self._device_mode_confirmed = False
         self._device_auto_upload = True
         self.latest_online_device_id = ""
         self.active_online_device_ids: list[str] = []
@@ -161,6 +165,10 @@ class SessionWidget(QWidget):
         self._monitor_aux_last_height = 140
         self._device_quick_status = "默认监测配置待连接后应用"
         self._hard_status_state = SessionWriteStatus()
+        self._session_change_entries: deque[SessionChangeEntry] = deque(maxlen=20)
+        self._last_manual_snapshot_status: dict[str, object] | None = None
+        self._last_address_mode_change: dict[str, object] | None = None
+        self._last_coeff_review_status: dict[str, object] | None = None
 
         self.replay_dataset: ReplayDataset | None = None
         self.replay_index = 0
@@ -294,6 +302,8 @@ class SessionWidget(QWidget):
         layout.addWidget(self.broadcast_banner)
 
         layout.addWidget(self._build_hard_status_bar())
+        layout.addWidget(self._build_session_change_summary_box())
+        layout.addWidget(self._build_task_entry_box())
         layout.addWidget(self._build_status_strip())
 
         self.pages = QTabWidget()
@@ -363,6 +373,135 @@ class SessionWidget(QWidget):
         layout.addWidget(self.hard_reason_value_label, 1, 3, 1, 3)
         layout.addWidget(self.hard_status_help_label, 2, 0, 1, 5)
         layout.addWidget(self.hard_status_note_label, 2, 5, 1, 1)
+        return box
+
+    def _build_task_entry_box(self) -> QWidget:
+        box = QGroupBox("任务入口")
+        layout = QGridLayout(box)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(8)
+
+        self.session_safety_hint_label = QLabel()
+        self.session_safety_hint_label.setWordWrap(True)
+        self.session_safety_hint_label.setProperty("warning", True)
+        self.session_safety_hint_detail_label = QLabel(
+            "进入写入阶段需切到工程模式、关闭只读锁，并满足 target/online 一致性。"
+        )
+        self.session_safety_hint_detail_label.setWordWrap(True)
+        self.session_safety_hint_detail_label.setProperty("muted", True)
+        self.task_entry_feedback_label = QLabel("可从这里直接打开常用工作流入口，不会自动发送危险写命令。")
+        self.task_entry_feedback_label.setWordWrap(True)
+        self.task_entry_feedback_label.setProperty("muted", True)
+
+        tasks = [
+            (
+                "新设备接入检查",
+                "先确认连接、安全握手和当前在线设备，再进入后续设置。",
+                "开始检查",
+                "_open_task_new_device_check",
+                "task_new_device_button",
+            ),
+            (
+                "读取当前参数快照",
+                "前往参数页并聚焦读取入口，先锁定当前设备状态。",
+                "前往读取",
+                "_open_task_read_snapshot",
+                "task_read_snapshot_button",
+            ),
+            (
+                "地址与模式设置",
+                "前往设备控制页处理地址、模式和串口相关参数。",
+                "打开控制页",
+                "_open_task_address_mode",
+                "task_address_mode_button",
+            ),
+            (
+                "系数读写与复核",
+                "前往系数中心查看当前系数、执行写入并核对结果。",
+                "打开系数页",
+                "_open_task_coeff_review",
+                "task_coeff_review_button",
+            ),
+            (
+                "导出诊断包",
+                "前往导出与回放页，集中查看变更总览并导出诊断资料。",
+                "前往导出",
+                "_open_task_export_diag",
+                "task_export_diag_button",
+            ),
+        ]
+
+        layout.addWidget(self.session_safety_hint_label, 0, 0, 1, 4)
+        layout.addWidget(self.session_safety_hint_detail_label, 1, 0, 1, 4)
+        self._task_status_labels: dict[str, QLabel] = {}
+        for row, (title, description, button_text, handler_name, attr_name) in enumerate(tasks, start=2):
+            task_key = attr_name.removeprefix("task_").removesuffix("_button")
+            title_label = QLabel(title)
+            title_label.setProperty("accent", True)
+            description_label = QLabel(description)
+            description_label.setWordWrap(True)
+            description_label.setProperty("muted", True)
+            status_title_label = QLabel("当前状态")
+            status_title_label.setProperty("muted", True)
+            status_label = QLabel("--")
+            status_label.setWordWrap(True)
+            button = QPushButton(button_text)
+            setattr(self, attr_name, button)
+            setattr(self, f"{attr_name}_label", title_label)
+            setattr(self, f"{attr_name}_description", description_label)
+            setattr(self, f"task_{task_key}_status_title_label", status_title_label)
+            setattr(self, f"task_{task_key}_status_label", status_label)
+            self._task_status_labels[task_key] = status_label
+            button.clicked.connect(getattr(self, handler_name))
+            layout.addWidget(title_label, row, 0)
+            layout.addWidget(description_label, row, 1)
+            status_cell = QWidget()
+            status_layout = QVBoxLayout(status_cell)
+            status_layout.setContentsMargins(0, 0, 0, 0)
+            status_layout.setSpacing(2)
+            status_layout.addWidget(status_title_label)
+            status_layout.addWidget(status_label)
+            layout.addWidget(status_cell, row, 2)
+            layout.addWidget(button, row, 3)
+        layout.addWidget(self.task_entry_feedback_label, len(tasks) + 2, 0, 1, 4)
+        self._refresh_session_safety_hint()
+        self._refresh_task_entry_states()
+        return box
+
+    def _build_session_change_summary_box(self) -> QWidget:
+        box = QGroupBox("参数变更总览摘要")
+        layout = QGridLayout(box)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setHorizontalSpacing(14)
+        layout.setVerticalSpacing(6)
+
+        self.change_summary_message_label = QLabel("本次会话暂无参数变更")
+        self.change_summary_message_label.setWordWrap(True)
+        self.change_summary_message_label.setProperty("muted", True)
+        self.change_summary_view_button = QPushButton("查看总览")
+        self.change_summary_view_button.clicked.connect(self._open_session_change_overview)
+
+        stats = [
+            ("total", "总数"),
+            ("consistent", "一致"),
+            ("mismatch", "不一致"),
+            ("unverifiable", "无法验证"),
+            ("failure", "失败类"),
+        ]
+        self._change_summary_value_labels: dict[str, QLabel] = {}
+        layout.addWidget(self.change_summary_message_label, 0, 0, 1, 4)
+        layout.addWidget(self.change_summary_view_button, 0, 4, 1, 1)
+        for column, (key, title) in enumerate(stats):
+            caption = QLabel(title)
+            caption.setProperty("muted", True)
+            value_label = QLabel("0")
+            setattr(self, f"change_summary_{key}_value_label", value_label)
+            self._change_summary_value_labels[key] = value_label
+            layout.addWidget(caption, 1, column)
+            layout.addWidget(value_label, 2, column)
+
+        self._refresh_session_change_summary()
         return box
 
     def _build_quick_connect_box(self) -> QWidget:
@@ -477,17 +616,18 @@ class SessionWidget(QWidget):
         box.setTitle("设备模式与权限")
         self.permission_combo = QComboBox()
         self.permission_combo.addItems(["READ_ONLY", "CONFIG", "CALIBRATION", "EXPERT"])
-        self.permission_combo.setCurrentText("CONFIG")
+        self.permission_combo.setCurrentText("READ_ONLY")
         self.session_mode_combo = QComboBox()
         self.session_mode_combo.addItem("只监听（绝不发命令）", SESSION_MODE_LISTEN_ONLY)
         self.session_mode_combo.addItem("安全握手（仅查询类命令）", SESSION_MODE_SAFE_HANDSHAKE)
         self.session_mode_combo.addItem("工程模式（允许正式控制命令）", SESSION_MODE_ENGINEERING)
-        self.session_mode_combo.setCurrentIndex(2)
+        self.session_mode_combo.setCurrentIndex(1)
         self.target_combo = QComboBox()
         self.target_combo.setEditable(True)
         self.target_combo.addItems(["001"])
         self.broadcast_check = QCheckBox("启用广播地址 FFF")
         self.read_only_lock_check = QCheckBox("只读会话锁")
+        self.read_only_lock_check.setChecked(True)
         self.show_expert_check = QCheckBox("显示串口助手")
         self.show_expert_check.setChecked(True)
         self.show_expert_check.hide()
@@ -945,7 +1085,29 @@ class SessionWidget(QWidget):
 
         layout.addWidget(export_box)
         layout.addWidget(replay_box, 1)
+        layout.addWidget(self._build_session_change_overview_box())
         return page
+
+    def _build_session_change_overview_box(self) -> QWidget:
+        box = QGroupBox("本次参数变更总览")
+        layout = QVBoxLayout(box)
+        self.change_overview_hint_label = QLabel("当前会话内最近 20 条参数变更会显示在这里，便于集中核对写前/目标/写后结果。")
+        self.change_overview_hint_label.setWordWrap(True)
+        self.change_overview_hint_label.setProperty("muted", True)
+        self.change_overview_table = QTableWidget(0, 8)
+        self.change_overview_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.change_overview_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.change_overview_table.setAlternatingRowColors(True)
+        self.change_overview_table.setWordWrap(True)
+        self.change_overview_table.verticalHeader().setVisible(False)
+        self.change_overview_table.horizontalHeader().setStretchLastSection(True)
+        self.change_overview_table.setHorizontalHeaderLabels(
+            ["时间", "命令/参数", "目标设备", "写前值", "目标值", "写后值", "结果", "说明"]
+        )
+        layout.addWidget(self.change_overview_hint_label)
+        layout.addWidget(self.change_overview_table, 1)
+        self._refresh_session_change_overview()
+        return box
 
     def _connect_signals(self) -> None:
         self.refresh_ports_button.clicked.connect(lambda: self._refresh_ports(force=False))
@@ -1345,8 +1507,272 @@ class SessionWidget(QWidget):
         self.chart_upper_summary_label.setText(self.chart_panel.slot_summary_text(0))
         self.chart_lower_summary_label.setText(self.chart_panel.slot_summary_text(1))
 
+    def _refresh_session_safety_hint(self) -> None:
+        if not hasattr(self, "permission_combo"):
+            self.session_safety_hint_label.setText(
+                "当前为安全接入模式，建议先识别设备并读取参数，再切换工程写入。"
+            )
+            return
+        if self._is_safe_onboarding_state():
+            self.session_safety_hint_label.setText(
+                "当前为安全接入模式，建议先识别设备并读取参数，再切换工程写入。"
+            )
+        else:
+            self.session_safety_hint_label.setText(
+                "当前会话已离开默认安全接入状态；进入写入阶段前仍需逐项确认安全条件。"
+            )
+
+    def _is_safe_onboarding_state(self) -> bool:
+        return (
+            self.permission_combo.currentText() == "READ_ONLY"
+            and self._current_session_mode() == SESSION_MODE_SAFE_HANDSHAKE
+            and self.read_only_lock_check.isChecked()
+            and not self.broadcast_check.isChecked()
+        )
+
+    def _set_task_entry_feedback(self, text: str) -> None:
+        self.task_entry_feedback_label.setText(text)
+
+    def _set_status_label_tone(self, label: QLabel, text: str, tone: str) -> None:
+        label.setText(text)
+        label.setProperty("muted", tone == "neutral")
+        if tone == "success":
+            label.setProperty("risk", "low")
+        elif tone == "warning":
+            label.setProperty("risk", "medium")
+        elif tone == "danger":
+            label.setProperty("risk", "high")
+        else:
+            label.setProperty("risk", None)
+        label.style().unpolish(label)
+        label.style().polish(label)
+
+    def _session_change_counts(self) -> dict[str, int]:
+        counts = {
+            "total": len(self._session_change_entries),
+            "consistent": 0,
+            "mismatch": 0,
+            "unverifiable": 0,
+            "failure": 0,
+        }
+        for entry in self._session_change_entries:
+            if entry.result_text == "一致":
+                counts["consistent"] += 1
+            elif entry.result_text == "不一致":
+                counts["mismatch"] += 1
+            elif entry.result_text == "无法验证":
+                counts["unverifiable"] += 1
+            elif entry.result_text in {"写入失败", "写前读取失败"}:
+                counts["failure"] += 1
+        return counts
+
+    def _refresh_session_change_summary(self) -> None:
+        if not hasattr(self, "change_summary_message_label"):
+            return
+        counts = self._session_change_counts()
+        for key, label in self._change_summary_value_labels.items():
+            value = str(counts.get(key, 0))
+            tone = "neutral"
+            if key == "consistent" and counts[key] > 0:
+                tone = "success"
+            elif key in {"mismatch", "unverifiable", "failure"} and counts[key] > 0:
+                tone = "danger" if key in {"mismatch", "failure"} else "warning"
+            elif key == "total" and counts[key] > 0:
+                tone = "warning"
+            self._set_status_label_tone(label, value, tone)
+        if counts["total"] == 0:
+            self._set_status_label_tone(self.change_summary_message_label, "本次会话暂无参数变更", "neutral")
+        else:
+            self._set_status_label_tone(
+                self.change_summary_message_label,
+                f"本次会话已有 {counts['total']} 条参数变更，可直接查看总览并继续导出诊断包。",
+                "warning",
+            )
+
+    @staticmethod
+    def _display_device_mode(mode_text: str, confirmed: bool) -> str:
+        if not confirmed:
+            return "待确认"
+        normalized = str(mode_text or "").strip().upper()
+        if normalized in {"MODE1", "1"}:
+            return "MODE1"
+        if normalized in {"MODE2", "2"}:
+            return "MODE2"
+        if normalized in {"MODE3", "3"}:
+            return "工厂模式"
+        return normalized or "待确认"
+
+    def _new_device_task_status(self) -> tuple[str, str]:
+        if not self.connected:
+            return "未连接", "neutral"
+        active_numeric_ids = sorted({device_id for device_id in self.active_online_device_ids if device_id.isdigit()})
+        if len(active_numeric_ids) > 1:
+            return "多个在线设备，需先收敛", "danger"
+        if len(active_numeric_ids) == 1:
+            online_id = active_numeric_ids[0]
+            target_id = self._current_target_id()
+            if target_id.isdigit() and target_id != online_id:
+                return "target/online 不一致", "danger"
+            return f"已识别唯一在线设备：{online_id}", "success"
+        return "已连接，待识别设备", "warning"
+
+    def _read_snapshot_task_status(self) -> tuple[str, str]:
+        if self._last_manual_snapshot_status is None:
+            return "尚未读取", "neutral"
+        timestamp = self._fmt_ts(self._last_manual_snapshot_status.get("timestamp"))
+        device_id = str(self._last_manual_snapshot_status.get("device_id") or "--")
+        if self._last_manual_snapshot_status.get("ok"):
+            return f"最近已读取：{timestamp} | 设备 {device_id}", "success"
+        return f"最近读取失败：{timestamp}", "danger"
+
+    def _address_mode_task_status(self) -> tuple[str, str]:
+        mode_text = self._display_device_mode(self._device_output_mode, self._device_mode_confirmed)
+        status = f"当前目标：{self._current_target_id()} | 当前模式：{mode_text}"
+        tone = "neutral" if mode_text == "待确认" else "success"
+        if self._last_address_mode_change is None:
+            return status, tone
+        change_name = str(self._last_address_mode_change.get("command_name") or "参数")
+        result_text = str(self._last_address_mode_change.get("result_text") or "--")
+        if result_text in {"写入失败", "写前读取失败", "不一致"}:
+            tone = "danger"
+        elif result_text == "无法验证":
+            tone = "warning"
+        else:
+            tone = "success"
+        return f"{status} | 最近设置：{change_name} / {result_text}", tone
+
+    def _coeff_review_task_status(self) -> tuple[str, str]:
+        if self._last_coeff_review_status is None:
+            return "尚未执行", "neutral"
+        result_text = str(self._last_coeff_review_status.get("result_text") or "--")
+        mapping = {
+            "一致": ("最近一次复核一致", "success"),
+            "不一致": ("最近一次复核不一致", "danger"),
+            "无法验证": ("最近一次无法验证", "warning"),
+            "写前读取失败": ("最近一次写前读取失败", "danger"),
+            "写入失败": ("最近一次写入失败", "danger"),
+        }
+        return mapping.get(result_text, (f"最近一次结果：{result_text}", "warning"))
+
+    def _export_diag_task_status(self) -> tuple[str, str]:
+        count = len(self._session_change_entries)
+        if count == 0:
+            return "本次会话暂无参数变更", "neutral"
+        return f"本次会话已有 {count} 条参数变更待导出", "warning"
+
+    def _refresh_task_entry_states(self) -> None:
+        if not hasattr(self, "_task_status_labels"):
+            return
+        status_builders = {
+            "new_device": self._new_device_task_status,
+            "read_snapshot": self._read_snapshot_task_status,
+            "address_mode": self._address_mode_task_status,
+            "coeff_review": self._coeff_review_task_status,
+            "export_diag": self._export_diag_task_status,
+        }
+        for task_key, builder in status_builders.items():
+            label = self._task_status_labels.get(task_key)
+            if label is None:
+                continue
+            text, tone = builder()
+            self._set_status_label_tone(label, text, tone)
+
+    def _open_session_change_overview(self) -> None:
+        self.pages.setCurrentIndex(self.export_tab_index)
+        if hasattr(self, "change_overview_table"):
+            if self.change_overview_table.rowCount() > 0 and self.change_overview_table.item(0, 0) is not None:
+                self.change_overview_table.setCurrentCell(0, 0)
+                self.change_overview_table.scrollToItem(self.change_overview_table.item(0, 0))
+            else:
+                self.change_overview_table.scrollToTop()
+            self.change_overview_table.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._set_task_entry_feedback("已打开“数据导出与回放”，并聚焦到“本次参数变更总览”。")
+
+    def _open_task_new_device_check(self) -> None:
+        self.pages.setCurrentIndex(self.settings_tab_index)
+        self.safe_handshake_button.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._set_task_entry_feedback("已打开“连接与设备模式”。建议先连接设备，再执行安全握手确认唯一在线设备。")
+
+    def _open_task_read_snapshot(self) -> None:
+        self.pages.setCurrentIndex(self.control_tab_index)
+        self.control_panel.read_page_button.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._set_task_entry_feedback("已打开“设备控制”。可先使用“读取本页默认配置/读取当前参数”锁定当前设备参数快照。")
+
+    def _open_task_address_mode(self) -> None:
+        self.pages.setCurrentIndex(self.control_tab_index)
+        self.control_panel.select_command("ID")
+        self._set_task_entry_feedback("已打开“设备控制”。可继续处理地址、模式和串口参数；不会自动发送写命令。")
+
+    def _open_task_coeff_review(self) -> None:
+        self.pages.setCurrentIndex(self.coeff_tab_index)
+        self.coeff_panel.select_command("SENCO1")
+        self._set_task_entry_feedback("已打开“系数中心”。建议先读回当前系数，再执行写入与复核。")
+
+    def _open_task_export_diag(self) -> None:
+        self.pages.setCurrentIndex(self.export_tab_index)
+        self.export_diag_page_button.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._set_task_entry_feedback("已打开“数据导出与回放”。可先查看本次参数变更总览，再导出诊断包。")
+
+    def _record_session_change(
+        self,
+        command_id: str,
+        report: WriteVerificationReport,
+        *,
+        timestamp: datetime | None = None,
+        target_device_id: str | None = None,
+    ) -> None:
+        command_name = command_id
+        try:
+            command_name = self.registry.get(command_id, self._current_profile_name()).display_name
+        except Exception:
+            pass
+        entry = SessionChangeEntry(
+            timestamp=timestamp or report.verified_at or datetime.now(),
+            command_name=command_name,
+            target_device_id=str(target_device_id or report.source_device_id or self._current_target_id() or "--"),
+            before_value=report.before.summary or "--",
+            target_value=report.target.summary or "--",
+            after_value=report.after.summary or "--",
+            result_text=report.result_text or "--",
+            detail_text=report.detail_text or "--",
+        )
+        change_state = {
+            "command_id": str(command_id or "").upper(),
+            "command_name": command_name,
+            "result_text": entry.result_text,
+            "timestamp": entry.timestamp,
+        }
+        if change_state["command_id"] in {"ID", "MODE"}:
+            self._last_address_mode_change = change_state
+        panel = self._panel_for_command_id(command_id)
+        if panel is self.coeff_panel or str(command_id or "").upper().startswith("SENCO"):
+            self._last_coeff_review_status = change_state
+        self._session_change_entries.appendleft(entry)
+        self._refresh_session_change_overview()
+
+    def _refresh_session_change_overview(self) -> None:
+        self.change_overview_table.setRowCount(len(self._session_change_entries))
+        for row, entry in enumerate(self._session_change_entries):
+            values = [
+                self._fmt_ts(entry.timestamp),
+                entry.command_name,
+                entry.target_device_id,
+                entry.before_value,
+                entry.target_value,
+                entry.after_value,
+                entry.result_text,
+                entry.detail_text,
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                self.change_overview_table.setItem(row, column, item)
+        self._refresh_session_change_summary()
+        self._refresh_task_entry_states()
+
     def _apply_persisted_state(self, state: dict) -> None:
         if not state:
+            self._refresh_session_safety_hint()
             return
         self.port_combo.setCurrentText(str(state.get("port", "SIMULATOR")))
         self.baud_combo.setCurrentText(str(state.get("baudrate", "115200")))
@@ -1358,15 +1784,15 @@ class SessionWidget(QWidget):
         session_mode = state.get("session_mode")
         if not session_mode and state.get("listen_only", False):
             session_mode = SESSION_MODE_LISTEN_ONLY
-        index = self.session_mode_combo.findData(session_mode or SESSION_MODE_ENGINEERING)
+        index = self.session_mode_combo.findData(session_mode or SESSION_MODE_SAFE_HANDSHAKE)
         self.session_mode_combo.setCurrentIndex(max(0, index))
         self.command_timeout_edit.setText(str(state.get("command_timeout_ms", "2000")))
         self.auto_reconnect_check.setChecked(bool(state.get("auto_reconnect", False)))
-        self.read_only_lock_check.setChecked(bool(state.get("read_only_lock", False)))
+        self.read_only_lock_check.setChecked(bool(state.get("read_only_lock", True)))
         self.profile_combo.setCurrentIndex(max(0, self.profile_combo.findData(state.get("profile_name", "bench_default"))))
         self.stream_hz_edit.setText(str(state.get("stream_hz", "10")))
         self.poll_interval_edit.setText(str(state.get("poll_interval_ms", "200")))
-        self.permission_combo.setCurrentText(str(state.get("permission_level", "CONFIG")))
+        self.permission_combo.setCurrentText(str(state.get("permission_level", "READ_ONLY")))
         self.show_expert_check.setChecked(True)
         self.target_combo.setCurrentText(str(state.get("target_id", "001")))
         self.session_note_edit.setText(str(state.get("session_note", "")))
@@ -1374,6 +1800,7 @@ class SessionWidget(QWidget):
         self.last_replay_file = str(state.get("last_replay_file") or "")
         self._monitor_aux_last_height = max(120, int(state.get("monitor_aux_height", 140) or 140))
         self._set_monitor_aux_expanded(bool(state.get("monitor_aux_expanded", False)))
+        self._refresh_session_safety_hint()
 
     def _refresh_ports(self, *, force: bool) -> None:
         now = time.monotonic()
@@ -1456,9 +1883,11 @@ class SessionWidget(QWidget):
             self.session_mode_combo.setCurrentIndex(engineering_index)
         self.baud_combo.setCurrentText("115200")
         self._device_output_mode = "MODE2"
+        self._device_mode_confirmed = True
         self._device_auto_upload = True
         self._set_device_quick_status("演示模式已准备为 MODE2 + 自动上传。")
         self._refresh_monitor_quick_controls()
+        self._refresh_task_entry_states()
         self._append_info_message("已切换为演示模式，端口使用 SIMULATOR。")
         self._update_status_strip()
 
@@ -1594,18 +2023,29 @@ class SessionWidget(QWidget):
         values: dict[str, str],
         write_payload: str,
     ) -> None:
+        target_snapshot = self.registry.build_target_snapshot(
+            definition.command_id,
+            values,
+            profile_name=self._current_profile_name(),
+        )
         read_target, target_error = self._resolve_explicit_read_target_id()
         if target_error:
+            report = WriteVerificationReport(
+                target=target_snapshot,
+                result_text="写前读取失败",
+                detail_text=f"未执行写入：{target_error}",
+            )
+            self._set_verification_report(definition.command_id, report)
+            self._record_session_change(
+                definition.command_id,
+                report,
+                target_device_id=self._current_target_id(),
+            )
             QMessageBox.warning(self, "写前读取失败", target_error)
             return
         readback_definition, read_payload = self.registry.build_readback_preview(
             definition.command_id,
             read_target,
-            profile_name=self._current_profile_name(),
-        )
-        target_snapshot = self.registry.build_target_snapshot(
-            definition.command_id,
-            values,
             profile_name=self._current_profile_name(),
         )
         self._set_verification_report(
@@ -2163,6 +2603,7 @@ class SessionWidget(QWidget):
             self.custom_panel.set_read_only_lock(self.read_only_lock_check.isChecked())
             self.custom_panel.set_broadcast_enabled(self.broadcast_check.isChecked())
             self.custom_panel.set_online_device_state(self.latest_online_device_id, self.active_online_device_ids)
+        self._refresh_session_safety_hint()
         self._update_status_strip()
         self._refresh_monitor_quick_controls()
 
@@ -2368,6 +2809,7 @@ class SessionWidget(QWidget):
         self.current_target_label.style().polish(self.current_target_label)
         self.broadcast_banner.setVisible(is_broadcast)
         self._update_hard_status_bar()
+        self._refresh_task_entry_states()
 
     def _set_connection_state(self, state_key: str, text: str) -> None:
         self.connection_state_label.setText(text)
@@ -2440,7 +2882,11 @@ class SessionWidget(QWidget):
     def _handle_frame(self, frame: ParsedFrame) -> None:
         self.last_frame = frame
         self.latest_frame_time = frame.timestamp
-        self._device_output_mode = f"MODE{frame.mode}"
+        next_mode = f"MODE{frame.mode}"
+        if next_mode != self._device_output_mode or not self._device_mode_confirmed:
+            self._device_output_mode = next_mode
+            self._device_mode_confirmed = True
+            self._refresh_task_entry_states()
         self.latest_frame_label.setText(f"最近有效数据: {self._fmt_ts(frame.timestamp)}")
         self._rx_frame_times.append(time.monotonic())
         self._schedule_diagnostic_snapshot_refresh()
@@ -2506,6 +2952,7 @@ class SessionWidget(QWidget):
             self._set_connection_state("connected", "已连接")
             self._disconnect_expected = False
             self._device_output_mode = self._current_parse_mode() or "MODE2"
+            self._device_mode_confirmed = False
             self._device_auto_upload = self._current_acquisition_mode() == "LISTEN"
             self._default_config_scheduled = False
             self._schedule_default_monitoring_config()
@@ -2517,6 +2964,7 @@ class SessionWidget(QWidget):
             self._pending_write_verifications.clear()
             self.latest_online_device_id = ""
             self.active_online_device_ids = []
+            self._device_mode_confirmed = False
             if self._disconnect_expected:
                 self.last_disconnect_reason = "手动断开"
                 self._set_connection_state("disconnected", "未连接")
@@ -2533,6 +2981,7 @@ class SessionWidget(QWidget):
         self._schedule_diagnostic_snapshot_refresh(immediate=True)
         self._apply_permission_mode()
         self._refresh_monitor_quick_controls()
+        self._refresh_task_entry_states()
 
     @Slot(object)
     def _handle_command_result(self, result: CommandResult) -> None:
@@ -2584,6 +3033,13 @@ class SessionWidget(QWidget):
         if result.ok:
             self._apply_readback_result(command_id, result)
         if phase == "manual":
+            self._last_manual_snapshot_status = {
+                "ok": result.ok,
+                "timestamp": result.timestamp,
+                "device_id": str(result.response_device_id or self._current_target_id() or "--"),
+                "command_id": command_id,
+            }
+            self._refresh_task_entry_states()
             return
 
         target_snapshot = request.get("target_snapshot")
@@ -2592,13 +3048,17 @@ class SessionWidget(QWidget):
 
         if phase == "before_write":
             if not result.ok:
-                self._set_verification_report(
+                report = WriteVerificationReport(
+                    target=target_snapshot,
+                    result_text="写前读取失败",
+                    detail_text=f"未执行写入：{result.message}",
+                )
+                self._set_verification_report(command_id, report)
+                self._record_session_change(
                     command_id,
-                    WriteVerificationReport(
-                        target=target_snapshot,
-                        result_text="写前读取失败",
-                        detail_text=f"未执行写入：{result.message}",
-                    ),
+                    report,
+                    timestamp=result.timestamp,
+                    target_device_id=str(result.response_device_id or self._current_target_id()),
                 )
                 return
             before_snapshot = self.registry.build_readback_snapshot(
@@ -2637,14 +3097,18 @@ class SessionWidget(QWidget):
             if not isinstance(before_snapshot, StructuredValueSnapshot):
                 before_snapshot = StructuredValueSnapshot()
             if not result.ok:
-                self._set_verification_report(
+                report = WriteVerificationReport(
+                    before=before_snapshot,
+                    target=target_snapshot,
+                    result_text="无法验证",
+                    detail_text=f"写命令 ACK 成功，但写后读取失败：{result.message}",
+                )
+                self._set_verification_report(command_id, report)
+                self._record_session_change(
                     command_id,
-                    WriteVerificationReport(
-                        before=before_snapshot,
-                        target=target_snapshot,
-                        result_text="无法验证",
-                        detail_text=f"写命令 ACK 成功，但写后读取失败：{result.message}",
-                    ),
+                    report,
+                    timestamp=result.timestamp,
+                    target_device_id=str(result.response_device_id or self._current_target_id()),
                 )
                 return
             after_snapshot = self.registry.build_readback_snapshot(
@@ -2658,17 +3122,21 @@ class SessionWidget(QWidget):
             if mismatches:
                 result_text = "不一致"
                 detail_text = f"不一致项：{', '.join(mismatches)}"
-            self._set_verification_report(
+            report = WriteVerificationReport(
+                before=before_snapshot,
+                target=target_snapshot,
+                after=after_snapshot,
+                result_text=result_text,
+                detail_text=detail_text,
+                verified_at=result.timestamp,
+                source_device_id=str(result.response_device_id or "--"),
+            )
+            self._set_verification_report(command_id, report)
+            self._record_session_change(
                 command_id,
-                WriteVerificationReport(
-                    before=before_snapshot,
-                    target=target_snapshot,
-                    after=after_snapshot,
-                    result_text=result_text,
-                    detail_text=detail_text,
-                    verified_at=result.timestamp,
-                    source_device_id=str(result.response_device_id or "--"),
-                ),
+                report,
+                timestamp=result.timestamp,
+                target_device_id=str(result.response_device_id or self._current_target_id()),
             )
 
     def _handle_pending_write_result(self, request: dict[str, object], result: CommandResult) -> None:
@@ -2682,14 +3150,18 @@ class SessionWidget(QWidget):
             target_snapshot = StructuredValueSnapshot()
 
         if not result.ok:
-            self._set_verification_report(
+            report = WriteVerificationReport(
+                before=before_snapshot,
+                target=target_snapshot,
+                result_text="写入失败",
+                detail_text=f"未执行写后复核：{result.message}",
+            )
+            self._set_verification_report(command_id, report)
+            self._record_session_change(
                 command_id,
-                WriteVerificationReport(
-                    before=before_snapshot,
-                    target=target_snapshot,
-                    result_text="写入失败",
-                    detail_text=f"未执行写后复核：{result.message}",
-                ),
+                report,
+                timestamp=result.timestamp,
+                target_device_id=str(result.response_device_id or self._current_target_id()),
             )
             return
 
@@ -2725,6 +3197,13 @@ class SessionWidget(QWidget):
     def _apply_readback_result(self, command_id: str, result: CommandResult) -> None:
         if not result.ok:
             return
+        normalized_command = str(command_id or "").strip().upper()
+        if normalized_command == "MODE":
+            mode_value = result.parsed_payload.get("mode")
+            if mode_value not in (None, ""):
+                self._device_output_mode = f"MODE{mode_value}"
+                self._device_mode_confirmed = True
+                self._refresh_task_entry_states()
         panel = self._panel_for_command_id(command_id)
         if panel is None:
             return
@@ -2904,6 +3383,8 @@ class SessionWidget(QWidget):
         return str(self.profile_combo.currentData() or "bench_default")
 
     def _current_target_id(self) -> str:
+        if not hasattr(self, "target_combo"):
+            return "001"
         return self.target_combo.currentText().strip().upper() or "001"
 
     def _current_session_mode(self) -> str:
