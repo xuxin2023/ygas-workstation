@@ -64,6 +64,13 @@ class AckResult:
     detail: str | None = None
 
 
+@dataclass(slots=True)
+class CommandEnvelope:
+    code: str
+    target_id: str
+    args: list[str]
+
+
 class StreamBuffer:
     """Accumulates byte chunks and emits complete CR/LF-delimited lines."""
 
@@ -105,6 +112,17 @@ class YGasProtocol:
         items = [str(command).strip().upper(), "YGAS", str(target_id).strip().upper()]
         items.extend(str(arg).strip() for arg in args if str(arg).strip() != "")
         return ",".join(items)
+
+    @staticmethod
+    def parse_command(payload: str) -> CommandEnvelope | None:
+        parts = YGasProtocol._split_parts(YGasProtocol._clean_wrappers(payload))
+        if len(parts) < 3 or parts[1].upper() != "YGAS" or not _DEVICE_RE.match(parts[2]):
+            return None
+        return CommandEnvelope(
+            code=parts[0].upper(),
+            target_id=parts[2].upper(),
+            args=parts[3:],
+        )
 
     @staticmethod
     def split_stream_lines(raw: bytes | str | list[Any] | tuple[Any, ...] | None) -> list[str]:
@@ -194,6 +212,27 @@ class YGasProtocol:
             "value": values[0] if len(values) == 1 else ",".join(values),
             "values": values,
         }
+
+    @staticmethod
+    def response_device_id(line: str, *, parse_mode: str = PARSE_MODE_AUTO) -> str | None:
+        ack = YGasProtocol.parse_ack(line)
+        if ack is not None:
+            return ack.device_id
+
+        for parser in (
+            YGasProtocol.parse_identity_reply,
+            YGasProtocol.parse_mode_value_reply,
+            YGasProtocol.parse_serial_config_reply,
+            YGasProtocol.parse_setting_value_reply,
+        ):
+            parsed = parser(line)
+            if parsed is not None:
+                return str(parsed.get("device_id") or "").upper() or None
+
+        frame = YGasProtocol.parse_line(line, parse_mode=parse_mode)
+        if frame is not None:
+            return frame.device_id
+        return None
 
     @staticmethod
     def parse_line(line: str, *, parse_mode: str = PARSE_MODE_AUTO) -> ParsedFrame | None:
