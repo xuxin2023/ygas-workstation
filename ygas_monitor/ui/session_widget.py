@@ -32,10 +32,12 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QSpinBox,
+    QSizePolicy,
     QSplitter,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -427,17 +429,7 @@ class SessionWidget(QWidget):
         return message
 
     def _chart_stream_status_text(self) -> str:
-        if self.replay_running:
-            return "回放"
-        if not self.connected:
-            return "未连接"
-        mapping = {
-            "idle": "未启动",
-            "starting": "启动中",
-            "running": "已开启",
-            "failed": "失败",
-        }
-        return mapping.get(self._stream_runtime_state, "未启动")
+        return self._build_stream_start_status()[1]
 
     def _refresh_chart_status_badge(self) -> None:
         if hasattr(self, "chart_panel"):
@@ -1105,8 +1097,10 @@ class SessionWidget(QWidget):
         self.monitor_aux_toolbar_toggle_button.setCheckable(True)
         self.monitor_aux_toolbar_toggle_button.setToolTip("展开后可查看状态面板、扩展数据、原始帧和异常摘要。")
         self.monitor_quick_status_label.setProperty("muted", True)
-        self.monitor_quick_status_label.setWordWrap(True)
-        self.monitor_quick_status_label.setToolTip("显示模式切换、自动上传和图槽切换的最近状态。")
+        self.monitor_quick_status_label.setWordWrap(False)
+        self.monitor_quick_status_label.setMinimumWidth(0)
+        self.monitor_quick_status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.monitor_quick_status_label.setToolTip(self._device_quick_status)
         controls.addWidget(self.monitor_connection_badge)
         controls.addWidget(self.monitor_mode_label)
         controls.addWidget(self.monitor_upload_badge)
@@ -1121,7 +1115,10 @@ class SessionWidget(QWidget):
         monitor_action_row.setSpacing(8)
         self.monitor_start_stream_button = QPushButton("启动实时流")
         self.monitor_start_stream_button.setProperty("accent", True)
-        self.monitor_diagnostic_button = QPushButton("诊断")
+        self.monitor_diagnostic_button = QToolButton()
+        self.monitor_diagnostic_button.setText("诊断")
+        self.monitor_diagnostic_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.monitor_diagnostic_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.monitor_diagnostic_menu = QMenu(self.monitor_diagnostic_button)
         self.monitor_diagnostic_auto_parse_action = self.monitor_diagnostic_menu.addAction("切换解析模式为自动识别")
         self.monitor_diagnostic_read_snapshot_action = self.monitor_diagnostic_menu.addAction("读取关键配置")
@@ -1900,6 +1897,7 @@ class SessionWidget(QWidget):
         self._device_quick_status = text
         if hasattr(self, "monitor_quick_status_label"):
             self.monitor_quick_status_label.setText(text)
+            self.monitor_quick_status_label.setToolTip(text)
 
     def _refresh_expected_hz_hint(self) -> None:
         if not hasattr(self, "expected_hz_hint_label"):
@@ -6276,7 +6274,8 @@ class SessionWidget(QWidget):
             f"控制说明：{self._hard_status_state.control_reason_text}\n"
             f"实时流：{self.hard_stream_status_label.text()}\n"
             f"实时流说明：{self._hard_status_state.stream_reason_text}\n"
-            "提示：实时监测模式只允许自动启动实时流；其他写入仍需工程模式、权限和复核。"
+            "提示：控制写入和实时流启动是两套不同的安全语义。"
+            " 实时监测模式只允许自动启动实时流；其他写入仍需工程模式、权限和复核。"
         )
         self.hard_write_permission_label.setToolTip(detail_tooltip)
         self.hard_stream_status_label.setToolTip(detail_tooltip)

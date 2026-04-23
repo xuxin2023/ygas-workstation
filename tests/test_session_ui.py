@@ -515,7 +515,7 @@ class SessionUiTests(unittest.TestCase):
             widget.close()
             self.app.processEvents()
 
-    def test_header_separates_control_write_and_stream_start_status(self) -> None:
+    def test_header_separates_control_write_and_stream_status(self) -> None:
         widget = SessionWidget("ui-header-stream-separation")
         try:
             widget.connected = True
@@ -530,12 +530,13 @@ class SessionUiTests(unittest.TestCase):
             tooltip = widget.session_header_detail_button.toolTip()
             self.assertIn("控制写入：禁止", tooltip)
             self.assertIn("实时流：可启动", tooltip)
+            self.assertIn("控制写入和实时流启动是两套不同的安全语义", tooltip)
         finally:
             widget.shutdown()
             widget.close()
             self.app.processEvents()
 
-    def test_default_monitoring_mode_shows_control_write_blocked_but_stream_start_allowed(self) -> None:
+    def test_default_monitoring_mode_shows_write_blocked_but_stream_allowed(self) -> None:
         widget = SessionWidget("ui-monitor-default-header")
         try:
             widget.connected = True
@@ -553,7 +554,7 @@ class SessionUiTests(unittest.TestCase):
             widget.close()
             self.app.processEvents()
 
-    def test_strict_read_only_blocks_both_control_write_and_stream_start(self) -> None:
+    def test_strict_read_only_blocks_write_and_stream(self) -> None:
         widget = SessionWidget("ui-header-strict-read-only")
         try:
             widget.connected = True
@@ -571,7 +572,7 @@ class SessionUiTests(unittest.TestCase):
             widget.close()
             self.app.processEvents()
 
-    def test_fff_target_shows_stream_broadcast_blocked(self) -> None:
+    def test_fff_blocks_auto_stream_broadcast_in_header(self) -> None:
         widget = SessionWidget("ui-header-fff-stream-block")
         try:
             widget.connected = True
@@ -4908,13 +4909,18 @@ class SessionUiTests(unittest.TestCase):
             widget.close()
             self.app.processEvents()
 
-    def test_monitor_diagnostic_actions_are_available_from_dropdown(self) -> None:
+    def test_monitor_diagnostic_actions_moved_into_dropdown(self) -> None:
         widget = SessionWidget("ui-monitor-diagnostic-menu")
         try:
             widget.show()
             widget.pages.setCurrentIndex(widget.monitor_tab_index)
             self.app.processEvents()
 
+            self.assertIsInstance(widget.monitor_diagnostic_button, QToolButton)
+            self.assertEqual(
+                widget.monitor_diagnostic_button.popupMode(),
+                QToolButton.ToolButtonPopupMode.InstantPopup,
+            )
             texts = [action.text() for action in widget.monitor_diagnostic_menu.actions()]
             self.assertEqual(
                 texts,
@@ -4925,7 +4931,7 @@ class SessionUiTests(unittest.TestCase):
             widget.close()
             self.app.processEvents()
 
-    def test_monitor_action_row_does_not_overflow_at_1280_width(self) -> None:
+    def test_monitor_action_row_no_overflow_at_1280_width(self) -> None:
         widget = SessionWidget("ui-monitor-action-row-fit")
         try:
             widget.resize(1280, 720)
@@ -4949,7 +4955,7 @@ class SessionUiTests(unittest.TestCase):
             widget.close()
             self.app.processEvents()
 
-    def test_chart_area_ratio_still_above_threshold_after_action_row_change(self) -> None:
+    def test_chart_ratio_not_regressed_after_action_row_slimming(self) -> None:
         widget = SessionWidget("ui-chart-ratio-after-action-row")
         try:
             widget.resize(1280, 720)
@@ -5012,12 +5018,15 @@ class SessionUiTests(unittest.TestCase):
     def test_chart_status_badge_shows_rx_and_valid_frame_state(self) -> None:
         widget = SessionWidget("ui-chart-status-badge")
         try:
-            self.assertIn("实时流：未连接", widget.chart_panel.status_badge_text())
+            self.assertIn("实时流：待连接", widget.chart_panel.status_badge_text())
             self.assertIn("RX：无", widget.chart_panel.status_badge_text())
             self.assertIn("有效帧：无", widget.chart_panel.status_badge_text())
 
             widget.connected = True
             widget.controller.connected = True
+            widget.port_combo.setCurrentText("COM35")
+            widget.target_combo.setCurrentText("001")
+            widget._handle_rx_device_state({"latest_rx_device_id": "001", "active_rx_device_ids": ["001"]})
             widget._refresh_monitor_quick_controls()
             widget._handle_raw(
                 RawFrameRecord(
