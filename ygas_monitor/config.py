@@ -5,9 +5,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# Keep the internal name stable for backward-compatible settings/log paths.
 APP_INTERNAL_NAME = "YGasWorkstation"
-APP_NAME = "YGAS Analyzer Monitor"
-APP_ORG = "OpenAI"
+APP_NAME = "GasAxis Studio"
+APP_SUBTITLE_ZH = "气体分析仪监测与联调平台"
+APP_SUBTITLE_EN = "Gas Analyzer Monitoring & Commissioning Platform"
+APP_ORG = "GasAxis Studio"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ASSET_DIR = PROJECT_ROOT / "assets"

@@ -32,10 +32,7 @@ class MainWindow(QMainWindow):
         self._session_count = 0
 
         self.setWindowTitle(f"{APP_NAME} - {APP_SUBTITLE_ZH}")
-        self.resize(
-            int(self.settings_payload["window"].get("width", 1600)),
-            int(self.settings_payload["window"].get("height", 980)),
-        )
+        self.resize(*self._initial_window_size())
 
         self._build_toolbar()
 
@@ -53,6 +50,17 @@ class MainWindow(QMainWindow):
 
         self.add_session(initial_state=self.settings_payload.get("session", {}))
         self.apply_theme_choice(self.theme_choice, persist=False)
+
+    def _initial_window_size(self) -> tuple[int, int]:
+        requested_width = int(self.settings_payload["window"].get("width", 1600))
+        requested_height = int(self.settings_payload["window"].get("height", 980))
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return requested_width, requested_height
+        available = screen.availableGeometry()
+        safe_width = max(640, available.width() - 24)
+        safe_height = max(520, available.height() - 24)
+        return min(requested_width, safe_width), min(requested_height, safe_height)
 
     def _build_toolbar(self) -> None:
         self.toolbar = QToolBar("主工具栏")

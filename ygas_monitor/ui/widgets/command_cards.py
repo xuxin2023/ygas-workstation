@@ -29,12 +29,17 @@ from ...commanding.registry import (
 )
 from ...commanding.safety import can_execute_command
 from ...models import WriteVerificationReport
+from ...protocols.ygas import YGasProtocol
 from ...protocols.senco_format import normalize_senco_input
+from ...services.auto_silence_policy import AutoSilencePolicy
 
 
 class CommandDetailWidget(QGroupBox):
     command_requested = Signal(object, object, str, str)
     readback_requested = Signal(object)
+    retry_restore_requested = Signal(str)
+    keep_upload_closed_requested = Signal(str)
+    view_command_log_requested = Signal()
 
     def __init__(
         self,
@@ -60,6 +65,7 @@ class CommandDetailWidget(QGroupBox):
         self._fields: dict[str, QWidget] = {}
         self._hints: dict[str, QLabel] = {}
         self._verification_report = WriteVerificationReport()
+        self._retry_restore_payload = ""
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -116,14 +122,59 @@ class CommandDetailWidget(QGroupBox):
         self.context_warning_label.hide()
         layout.addWidget(self.context_warning_label)
 
+        self.result_status_label = QLabel("结果状态: --")
+        self.result_status_label.setWordWrap(True)
+        self.result_status_label.setProperty("muted", True)
+        layout.addWidget(self.result_status_label)
+
+        self.result_evidence_label = QLabel("结果证据: --")
+        self.result_evidence_label.setWordWrap(True)
+        self.result_evidence_label.setProperty("muted", True)
+        layout.addWidget(self.result_evidence_label)
+
+        self.result_explain_label = QLabel("解释与建议: --")
+        self.result_explain_label.setWordWrap(True)
+        self.result_explain_label.setProperty("muted", True)
+        layout.addWidget(self.result_explain_label)
+
         self.last_response_label = QLabel("最近一次响应: --")
         self.last_response_label.setWordWrap(True)
         self.last_response_label.setProperty("muted", True)
         layout.addWidget(self.last_response_label)
 
+        self.restore_retry_button = QPushButton("重试恢复主动上传")
+        self.restore_retry_button.clicked.connect(lambda _checked=False: self._emit_retry_restore_request())
+        self.keep_upload_closed_button = QPushButton("保持关闭")
+        self.keep_upload_closed_button.clicked.connect(lambda _checked=False: self._emit_keep_upload_closed_request())
+        self.view_command_log_button = QPushButton("查看命令日志")
+        self.view_command_log_button.clicked.connect(lambda _checked=False: self.view_command_log_requested.emit())
+        self.restore_action_hint_label = QLabel("")
+        self.restore_action_hint_label.setWordWrap(True)
+        self.restore_action_hint_label.setProperty("muted", True)
+        self.restore_action_row = QWidget()
+        restore_action_layout = QHBoxLayout(self.restore_action_row)
+        restore_action_layout.setContentsMargins(0, 0, 0, 0)
+        restore_action_layout.setSpacing(8)
+        restore_action_layout.addWidget(self.restore_retry_button)
+        restore_action_layout.addWidget(self.keep_upload_closed_button)
+        restore_action_layout.addWidget(self.view_command_log_button)
+        restore_action_layout.addStretch(1)
+        self.restore_action_row.hide()
+        self.restore_action_hint_label.hide()
+        layout.addWidget(self.restore_action_row)
+        layout.addWidget(self.restore_action_hint_label)
+
         self.readback_button = QPushButton("读取当前参数")
         self.readback_button.clicked.connect(self._emit_readback_request)
         layout.addWidget(self.readback_button)
+        self.quiet_read_check = QCheckBox("暂停上传后读取")
+        self.quiet_read_check.setToolTip(
+            "读取前临时发送 SETCOMWAY=0，暂停设备主动上传，减少自动上传数据流对 ACK/读回判断的干扰。"
+            " 该动作不会停止设备测量，只是临时停止主动上报实时数据。"
+            " 读取完成后将按原始上传状态决定是否恢复。"
+        )
+        self.quiet_read_check.toggled.connect(self.refresh_preview)
+        layout.addWidget(self.quiet_read_check)
 
         self.readback_value_label = QLabel("当前值: --")
         self.readback_value_label.setWordWrap(True)
@@ -185,9 +236,25 @@ class CommandDetailWidget(QGroupBox):
         scroll_layout = QVBoxLayout(scroll_content)
         scroll_layout.setContentsMargins(0, 0, 0, 0)
         scroll_layout.setSpacing(8)
+        action_widgets = {
+            self.result_status_label,
+            self.result_evidence_label,
+            self.result_explain_label,
+            self.last_response_label,
+            self.restore_action_row,
+            self.restore_action_hint_label,
+            self.readback_button,
+            self.readback_value_label,
+            self.readback_time_label,
+            self.readback_device_label,
+            self.verification_box,
+            self.send_button,
+        }
         for item in content_items[:-2]:
             child_layout = item.layout()
             child_widget = item.widget()
+            if child_widget in action_widgets:
+                continue
             if child_layout is not None:
                 scroll_layout.addLayout(child_layout)
             elif child_widget is not None:
@@ -199,11 +266,17 @@ class CommandDetailWidget(QGroupBox):
         action_layout = QVBoxLayout(action_box)
         action_layout.setContentsMargins(10, 10, 10, 10)
         action_layout.setSpacing(8)
+        action_layout.addWidget(self.result_status_label)
+        action_layout.addWidget(self.result_evidence_label)
+        action_layout.addWidget(self.result_explain_label)
         action_layout.addWidget(self.last_response_label)
+        action_layout.addWidget(self.restore_action_row)
+        action_layout.addWidget(self.restore_action_hint_label)
         action_layout.addWidget(self.readback_button)
         action_layout.addWidget(self.readback_value_label)
         action_layout.addWidget(self.readback_time_label)
         action_layout.addWidget(self.readback_device_label)
+        action_layout.addWidget(self.verification_box)
         action_layout.addWidget(self.send_button)
 
         layout.addWidget(self.content_scroll, 1)
@@ -221,7 +294,11 @@ class CommandDetailWidget(QGroupBox):
         self.risk_value.style().unpolish(self.risk_value)
         self.risk_value.style().polish(self.risk_value)
         self.broadcast_value.setText(self._broadcast_policy_label(definition.broadcast_policy))
+        self.result_status_label.setText("结果状态: --")
+        self.result_evidence_label.setText("结果证据: --")
+        self.result_explain_label.setText("解释与建议: --")
         self.last_response_label.setText("最近一次响应: --")
+        self._clear_restore_actions()
         self.set_readback_snapshot(current_value="--", timestamp_text="--", device_id="--")
         self.set_verification_report(WriteVerificationReport())
         self._rebuild_form()
@@ -317,6 +394,59 @@ class CommandDetailWidget(QGroupBox):
             warnings.append(f"当前权限不足，需要 {permission_label(self.definition.required_permission)}。")
         if not safety_ok:
             warnings.append(safety_reason)
+        if effective_target == "FFF":
+            warnings.append("FFF 广播：会影响总线上所有响应设备。")
+        if self.definition.command_id.upper() == "MODE" and values.get("mode") == "2":
+            warnings.append("MODE2 表示校准模式，请确认现场工况允许。")
+            if effective_target == "FFF":
+                warnings.append("MODE2 校准模式 + FFF 广播属于高风险组合，发送前请再次确认。")
+        if self.definition.command_id.upper() == "MODE":
+            warnings.append("MODE：改变工作模式。")
+        if self.definition.command_id.upper() == "FTD":
+            warnings.append("FTD：改变自动上传频率。")
+        if self.definition.command_id.upper() == "SETCOMWAY" and values.get("mode") == "1":
+            warnings.append("本次命令会开启主动上传。该命令不会修改 FTD 上传频率。")
+        if self.definition.command_id.upper() == "SETCOMWAY":
+            warnings.append("SETCOMWAY：开启/关闭主动上传。")
+        preview_envelope = YGasProtocol.parse_command(preview) if preview else None
+        expected_silence_device_id = self._expected_auto_silence_device_id(effective_target)
+        pre_silence_text = AutoSilencePolicy.describe_pre_silence(
+            self.definition.command_id,
+            effective_target,
+            values,
+            preview_envelope,
+            active_device_ids=self.active_online_device_ids,
+            expected_device_id=expected_silence_device_id,
+            allow_broadcast=self._allow_broadcast_silence(values),
+        )
+        if pre_silence_text:
+            warnings.append(pre_silence_text)
+        self_silence_text = AutoSilencePolicy.describe_self_silence(
+            self.definition.command_id,
+            effective_target,
+            values,
+            preview_envelope,
+        )
+        if self_silence_text:
+            warnings.append(self_silence_text)
+        quiet_read_values = dict(values)
+        if self.quiet_read_check.isChecked():
+            quiet_read_values["quiet_read"] = "1"
+        quiet_read_text = AutoSilencePolicy.describe_quiet_read(
+            self.definition.command_id,
+            effective_target,
+            quiet_read_values,
+            preview_envelope,
+            active_device_ids=self.active_online_device_ids,
+            expected_device_id=expected_silence_device_id,
+            allow_broadcast=self._allow_broadcast_silence(quiet_read_values),
+        )
+        if quiet_read_text:
+            warnings.append(quiet_read_text)
+        if self.definition.command_id.upper() == "READDATA":
+            warnings.append(
+                "自动上传开启时，READDATA 返回帧可能与自动流无法可靠区分；请直接查看实时数据，或先关闭主动上传后再执行。"
+            )
         if self._is_write_command() and self.force_single_target_check.isChecked():
             warnings.append(f"当前已从默认 FFF 广播改为单设备目标 {effective_target}，请确认不会误写其他设备。")
 
@@ -327,18 +457,55 @@ class CommandDetailWidget(QGroupBox):
         self.force_single_target_check.setVisible(self._is_write_command())
         self.target_override_edit.setVisible(self._is_write_command())
         self._refresh_readback_button()
+        self._refresh_restore_actions()
         self.send_button.setEnabled(valid and ok and permission_ok and safety_ok and bool(preview))
 
-    def set_last_response(self, command_text: str, ok: bool, message: str) -> None:
+    def set_last_response(self, command_text: str, ok: bool, message: str, *, result: object | None = None) -> None:
         code = str(command_text or "").split(",", 1)[0].strip().upper().replace("[FFF] ", "")
         if code != self.definition.code:
             return
-        state = "成功" if ok else "失败"
+        timeout_reason = str(getattr(result, "timeout_reason", "") or "")
+        if timeout_reason == "telemetry_data_ambiguous":
+            state = "未判定：自动上传流中无法归属"
+        else:
+            state = "成功" if ok else "失败"
+        main_message = str(message or "").strip()
+        evidence_text = main_message
+        explain_text = "--"
+        if " | 观测：" in main_message:
+            prefix, observation = main_message.split(" | 观测：", 1)
+            main_message = prefix.strip()
+            evidence_text = f"{main_message} | 观测：{observation.strip()}"
+        if "当前设备正在自动上传实时数据，READDATA 返回帧与自动流无法可靠区分。" in evidence_text:
+            explain_text = (
+                "当前设备正在自动上传实时数据，READDATA 返回帧与自动流无法可靠区分。"
+                "请直接查看实时数据，或先关闭主动上传后再执行 READDATA。"
+            )
+        elif "SETCOMWAY=0" in evidence_text or "命令复核窗口" in evidence_text or "暂停主动上传" in evidence_text:
+            explain_text = "系统已尝试先发送 SETCOMWAY=0，进入命令复核窗口；该动作会临时暂停主动上传并记录日志。"
+        self.result_status_label.setText(f"结果状态: {state}")
+        self.result_status_label.setProperty("risk", "high" if (not ok and timeout_reason != "telemetry_data_ambiguous") else "low")
+        self.result_status_label.setProperty("muted", False)
+        self.result_status_label.style().unpolish(self.result_status_label)
+        self.result_status_label.style().polish(self.result_status_label)
+        self.result_evidence_label.setText(f"结果证据: {evidence_text or '--'}")
+        self.result_evidence_label.setProperty("muted", False if evidence_text else True)
+        self.result_evidence_label.style().unpolish(self.result_evidence_label)
+        self.result_evidence_label.style().polish(self.result_evidence_label)
+        self.result_explain_label.setText(f"解释与建议: {explain_text}")
+        self.result_explain_label.setProperty("muted", explain_text in {"", "--"})
+        self.result_explain_label.style().unpolish(self.result_explain_label)
+        self.result_explain_label.style().polish(self.result_explain_label)
         self.last_response_label.setText(f"最近一次响应: {state} | {message}")
         self.last_response_label.setProperty("risk", "high" if not ok else "low")
-        self.last_response_label.setProperty("muted", False if ok else True)
+        self.last_response_label.setProperty("muted", False)
         self.last_response_label.style().unpolish(self.last_response_label)
         self.last_response_label.style().polish(self.last_response_label)
+        if str(getattr(result, "action_type", "") or "") == "auto_silence_restore" and not ok:
+            self._retry_restore_payload = str(getattr(result, "command", "") or "").strip()
+        else:
+            self._retry_restore_payload = ""
+        self._refresh_restore_actions()
 
     def _emit_request(self) -> None:
         self.command_requested.emit(
@@ -350,6 +517,73 @@ class CommandDetailWidget(QGroupBox):
 
     def _emit_readback_request(self) -> None:
         self.readback_requested.emit(self.definition)
+
+    def _emit_retry_restore_request(self) -> None:
+        if self._retry_restore_payload:
+            self.restore_retry_button.setEnabled(False)
+            self.restore_action_hint_label.setText("正在发送重试恢复主动上传命令……")
+            self.restore_action_hint_label.setProperty("warning", False)
+            self.restore_action_hint_label.setProperty("muted", True)
+            self.restore_action_hint_label.style().unpolish(self.restore_action_hint_label)
+            self.restore_action_hint_label.style().polish(self.restore_action_hint_label)
+            self.retry_restore_requested.emit(self._retry_restore_payload)
+
+    def _emit_keep_upload_closed_request(self) -> None:
+        payload = self._retry_restore_payload
+        self._clear_restore_actions()
+        self.keep_upload_closed_requested.emit(payload)
+
+    def quiet_read_requested(self) -> bool:
+        return self.quiet_read_check.isVisible() and self.quiet_read_check.isChecked()
+
+    def _refresh_restore_actions(self) -> None:
+        visible = bool(self._retry_restore_payload)
+        self.restore_action_row.setVisible(visible)
+        self.restore_action_hint_label.setVisible(visible)
+        if not visible:
+            self.restore_action_hint_label.setText("")
+            self.restore_retry_button.setToolTip("")
+            return
+        enabled, reason = self._can_retry_restore()
+        self.restore_retry_button.setEnabled(enabled)
+        self.restore_retry_button.setToolTip("" if enabled else reason)
+        if enabled:
+            self.restore_action_hint_label.setText("恢复失败后可直接重试恢复主动上传，也可先保持关闭。")
+            self.restore_action_hint_label.setProperty("warning", False)
+            self.restore_action_hint_label.setProperty("muted", True)
+        else:
+            self.restore_action_hint_label.setText(f"当前不可重试恢复主动上传：{reason}")
+            self.restore_action_hint_label.setProperty("warning", True)
+            self.restore_action_hint_label.setProperty("muted", False)
+        self.restore_action_hint_label.style().unpolish(self.restore_action_hint_label)
+        self.restore_action_hint_label.style().polish(self.restore_action_hint_label)
+
+    def refresh_restore_actions(self) -> None:
+        self._refresh_restore_actions()
+
+    def _clear_restore_actions(self) -> None:
+        self._retry_restore_payload = ""
+        self.restore_action_row.hide()
+        self.restore_action_hint_label.hide()
+        self.restore_action_hint_label.setText("")
+        self.restore_retry_button.setEnabled(True)
+        self.restore_retry_button.setToolTip("")
+
+    def _can_retry_restore(self) -> tuple[bool, str]:
+        definition = self.registry.get("SETCOMWAY", self.profile_name)
+        permission_ok = has_permission(self.permission_level, definition.required_permission)
+        if not permission_ok:
+            return False, f"至少需要 {permission_label(definition.required_permission)} 权限。"
+        safety_ok, safety_reason = can_execute_command(
+            definition,
+            connected=self.connected,
+            session_mode=self.session_mode,
+            read_only_lock=self.read_only_lock,
+            replay_running=self.replay_blocked,
+        )
+        if not safety_ok:
+            return False, safety_reason
+        return True, ""
 
     def set_readback_snapshot(self, *, current_value: str, timestamp_text: str, device_id: str) -> None:
         self.readback_value_label.setText(f"当前值: {current_value or '--'}")
@@ -391,13 +625,22 @@ class CommandDetailWidget(QGroupBox):
         self.refresh_preview()
 
     def _refresh_readback_button(self) -> None:
+        preview_envelope = YGasProtocol.parse_command(self.preview_label.text().strip())
         visible = self._is_write_command() and self.registry.supports_readback(self.definition.command_id)
+        quiet_read_visible = visible or AutoSilencePolicy.requires_quiet_window_for_read(
+            self.definition.command_id,
+            {"quiet_read": "1"},
+            preview_envelope,
+        )
         self.readback_button.setVisible(visible)
+        self.quiet_read_check.setVisible(quiet_read_visible)
         self.readback_value_label.setVisible(visible)
         self.readback_time_label.setVisible(visible)
         self.readback_device_label.setVisible(visible)
         self.verification_box.setVisible(visible)
         if not visible:
+            if not quiet_read_visible:
+                self.quiet_read_check.setChecked(False)
             return
 
         readback_definition = self.registry.readback_definition(self.definition.command_id, self.profile_name)
@@ -440,6 +683,21 @@ class CommandDetailWidget(QGroupBox):
 
     def _active_numeric_online_ids(self) -> list[str]:
         return sorted({device_id for device_id in self.active_online_device_ids if device_id.isdigit()})
+
+    def _expected_auto_silence_device_id(self, effective_target: str) -> str:
+        if str(effective_target or "").isdigit():
+            return str(effective_target).upper()
+        target_id = str(self.target_id or "").strip().upper()
+        if target_id.isdigit():
+            return target_id
+        active_numeric_ids = self._active_numeric_online_ids()
+        if len(active_numeric_ids) == 1:
+            return active_numeric_ids[0]
+        return ""
+
+    @staticmethod
+    def _allow_broadcast_silence(values: dict[str, str]) -> bool:
+        return str(values.get("allow_broadcast_silence", "")).strip().lower() in {"1", "true", "yes", "on"}
 
     def _rebuild_form(self) -> None:
         self._fields.clear()
@@ -600,16 +858,16 @@ class CommandDetailWidget(QGroupBox):
     def _session_mode_label(session_mode: str) -> str:
         mapping = {
             "LISTEN_ONLY": "只监听",
-            "SAFE_HANDSHAKE": "安全握手",
-            "ENGINEERING": "工程模式",
+            "SAFE_HANDSHAKE": "实时监测",
+            "ENGINEERING": "工程联调",
             "REPLAY": "回放",
         }
         return mapping.get(str(session_mode or "").upper(), session_mode or "--")
 
 
 class CommandWorkspacePanel(QWidget):
-    command_requested = Signal(object, object, str, str)
-    readback_requested = Signal(object)
+    command_requested = Signal(object, object, str, str, object)
+    readback_requested = Signal(object, object)
 
     def __init__(
         self,
@@ -617,16 +875,19 @@ class CommandWorkspacePanel(QWidget):
         family_names: list[str],
         *,
         profile_name: str = "bench_default",
+        source_panel: str = "",
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
         self.registry = registry
         self.family_names = family_names
         self.profile_name = profile_name
+        self.source_panel = str(source_panel or "")
         self.target_id = "001"
         self.latest_online_device_id = ""
         self.active_online_device_ids: list[str] = []
         self.permission_level = "READ_ONLY"
+        self.auto_upload_state = "unknown"
         self.broadcast_enabled = False
         self.replay_blocked = False
         self.connected = False
@@ -673,8 +934,8 @@ class CommandWorkspacePanel(QWidget):
 
         first_definition = self._refresh_tree(profile_name)
         self.detail_widget = CommandDetailWidget(self.registry, first_definition, profile_name=profile_name)
-        self.detail_widget.command_requested.connect(self.command_requested)
-        self.detail_widget.readback_requested.connect(self.readback_requested)
+        self.detail_widget.command_requested.connect(self._relay_command_request)
+        self.detail_widget.readback_requested.connect(self._relay_readback_request)
         splitter.addWidget(self.detail_widget)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 6)
@@ -706,6 +967,9 @@ class CommandWorkspacePanel(QWidget):
         self.detail_widget.set_permission_level(permission_level)
         self._refresh_context_banner()
 
+    def set_auto_upload_state(self, state: str) -> None:
+        self.auto_upload_state = str(state or "unknown")
+
     def set_broadcast_enabled(self, enabled: bool) -> None:
         self.broadcast_enabled = enabled
         self.detail_widget.set_broadcast_enabled(enabled)
@@ -729,8 +993,8 @@ class CommandWorkspacePanel(QWidget):
         self.detail_widget.set_read_only_lock(locked)
         self._refresh_context_banner()
 
-    def set_last_response(self, command_text: str, ok: bool, message: str) -> None:
-        self.detail_widget.set_last_response(command_text, ok, message)
+    def set_last_response(self, command_text: str, ok: bool, message: str, *, result: object | None = None) -> None:
+        self.detail_widget.set_last_response(command_text, ok, message, result=result)
 
     def set_readback_result(
         self,
@@ -765,6 +1029,12 @@ class CommandWorkspacePanel(QWidget):
 
     def current_command_id(self) -> str:
         return self.detail_widget.definition.command_id
+
+    def prepare_command(self, command_id: str, prefill_values: dict[str, str] | None = None) -> CommandDetailWidget:
+        self.select_command(command_id)
+        self.detail_widget.apply_prefill_values(prefill_values or {})
+        self.detail_widget.send_button.setFocus(Qt.FocusReason.OtherFocusReason)
+        return self.detail_widget
 
     def select_command(self, command_id: str) -> None:
         for index in range(self.command_tree.topLevelItemCount()):
@@ -836,6 +1106,35 @@ class CommandWorkspacePanel(QWidget):
         self._apply_readback_state(command_id)
         self._apply_verification_state(command_id)
 
+    def _relay_command_request(
+        self,
+        definition: CommandDefinition,
+        values: dict[str, str],
+        preview: str,
+        effective_target: str,
+    ) -> None:
+        self.command_requested.emit(
+            definition,
+            values,
+            preview,
+            effective_target,
+            {
+                "quiet_read_requested": self.detail_widget.quiet_read_requested(),
+                "source_panel": self.source_panel,
+                "original_auto_upload_state": self.auto_upload_state,
+            },
+        )
+
+    def _relay_readback_request(self, definition: CommandDefinition) -> None:
+        self.readback_requested.emit(
+            definition,
+            {
+                "quiet_read_requested": self.detail_widget.quiet_read_requested(),
+                "source_panel": self.source_panel,
+                "original_auto_upload_state": self.auto_upload_state,
+            },
+        )
+
     def _apply_readback_state(self, command_id: str) -> None:
         state = self._readback_state_by_command.get(str(command_id).upper())
         if state is None:
@@ -895,7 +1194,7 @@ class CommandWorkspacePanel(QWidget):
 
         risk_text = ""
         if target_id == "FFF":
-            risk_text = "当前目标为广播地址 FFF：下发命令前请确认现场隔离、权限等级和影响范围。"
+            risk_text = "当前目标为 FFF 广播，可能影响总线上所有设备；下发命令前请确认现场隔离、权限等级和影响范围。"
         elif self.broadcast_enabled:
             risk_text = (
                 "写命令发送地址默认可使用 FFF，但对象一致性仍按当前目标设备与在线设备校验；"

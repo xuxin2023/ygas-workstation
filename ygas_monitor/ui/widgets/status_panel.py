@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -22,6 +24,7 @@ class StatusPanel(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._pending_frame: ParsedFrame | None = None
+        self._pending_events: list[tuple[str, str, str]] = []
         self._last_status_key: tuple[str, int] | None = None
         self._last_device_text = "设备: --"
         self._last_mode_text = "模式: --"
@@ -47,9 +50,15 @@ class StatusPanel(QWidget):
         self.events = QListWidget()
         event_layout.addWidget(self.events)
 
+        splitter = QSplitter(Qt.Vertical)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self.table)
+        splitter.addWidget(event_box)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
         layout.addLayout(summary_row)
-        layout.addWidget(self.table, 1)
-        layout.addWidget(event_box, 1)
+        layout.addWidget(splitter, 1)
 
     def update_frame(self, frame: ParsedFrame) -> None:
         self._pending_frame = frame
@@ -79,11 +88,15 @@ class StatusPanel(QWidget):
         self.append_event("状态", alarm.timestamp.strftime("%H:%M:%S.%f")[:-3], alarm.message)
 
     def append_event(self, category: str, time_text: str, message: str) -> None:
+        if not self.isVisible():
+            self._pending_events.append((category, time_text, message))
+            return
         item = QListWidgetItem(f"[{category}] {time_text} | {message}")
         self.events.insertItem(0, item)
 
     def clear(self) -> None:
         self._pending_frame = None
+        self._pending_events.clear()
         self._last_status_key = None
         self._set_label(self.device_label, "设备: --", "_last_device_text")
         self._set_label(self.mode_label, "模式: --", "_last_mode_text")
@@ -95,9 +108,19 @@ class StatusPanel(QWidget):
         super().showEvent(event)
         if self._pending_frame is not None:
             self._apply_frame(self._pending_frame)
+        self._flush_pending_events()
 
     def _set_label(self, label: QLabel, text: str, attr_name: str) -> None:
         if getattr(self, attr_name) == text:
             return
         setattr(self, attr_name, text)
         label.setText(text)
+
+    def _flush_pending_events(self) -> None:
+        if not self._pending_events:
+            return
+        pending = list(reversed(self._pending_events))
+        self._pending_events.clear()
+        for category, time_text, message in pending:
+            item = QListWidgetItem(f"[{category}] {time_text} | {message}")
+            self.events.insertItem(0, item)

@@ -7,10 +7,10 @@ import platform
 import sys
 from typing import Any
 
-from .config import APP_INTERNAL_NAME, APP_NAME, LOG_DIR, SETTINGS_DIR
+from .config import APP_INTERNAL_NAME, APP_NAME, APP_SUBTITLE_EN, APP_SUBTITLE_ZH, LOG_DIR, SETTINGS_DIR
 
-APP_VERSION = "0.9.0-rc1"
-APP_DESCRIPTION = "Professional YGAS analyzer workstation for monitoring, diagnostics, control, replay, and export."
+APP_VERSION = "0.9.0-rc5"
+APP_DESCRIPTION = APP_SUBTITLE_EN
 BUILD_DATE = datetime.now().strftime("%Y-%m-%d")
 
 
@@ -18,6 +18,8 @@ def get_version_info() -> dict[str, Any]:
     return {
         "app_internal_name": APP_INTERNAL_NAME,
         "app_name": APP_NAME,
+        "subtitle_zh": APP_SUBTITLE_ZH,
+        "subtitle_en": APP_SUBTITLE_EN,
         "version": APP_VERSION,
         "description": APP_DESCRIPTION,
         "build_date": BUILD_DATE,
@@ -33,6 +35,8 @@ def environment_summary_text() -> str:
     info = get_version_info()
     return (
         f"{info['app_name']} {info['version']}\n"
+        f"{info['subtitle_zh']}\n"
+        f"{info['subtitle_en']}\n"
         f"Build Date: {info['build_date']}\n"
         f"Python: {info['python']}\n"
         f"Platform: {info['platform']}\n"

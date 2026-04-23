@@ -12,6 +12,7 @@ from PySide6.QtCore import QPointF, Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -43,7 +44,7 @@ FIELD_LABELS = {
     "h2o_density": "H2O 密度",
     "co2_ratio_raw": "CO2 比值（原始）",
     "co2_ratio_f": "CO2 比值（滤波）",
-    "co2_ratio_delta": "CO2 比值（差值）",
+    "co2_ratio_delta": "CO2 滤波差值",
     "h2o_ratio_raw": "H2O 比值（原始）",
     "h2o_ratio_f": "H2O 比值（滤波）",
     "h2o_ratio_delta": "H2O 比值（差值）",
@@ -264,9 +265,9 @@ def describe_group_state(
     if total_frames <= 0:
         return GroupDisplayState(
             show_plot=False,
-            banner_text="等待实时数据或开始回放。",
-            placeholder_title="尚未收到任何帧",
-            placeholder_body="连接设备、启动模拟器或开始回放后，此处会自动显示实时曲线。",
+            banner_text="等待实时数据",
+            placeholder_title="等待实时数据",
+            placeholder_body="请先连接设备或加载回放。",
         )
     if enabled_field_count <= 0:
         return GroupDisplayState(
@@ -385,19 +386,35 @@ class RealtimeChartPanel(QWidget):
         self._slot_states: list[SlotState] = []
         self._slot_view_ids = list(DEFAULT_SLOT_VIEW_IDS)
         self._slot_refresh_dirty = [False, False]
+        self._idle_placeholder_title = "等待实时数据"
+        self._idle_placeholder_body = "请先连接设备或加载回放。"
+        self._stream_status_text = "未启动"
+        self._raw_rx_seen = False
+        self._valid_frame_seen = False
+        self._parse_mode_text = "AUTO"
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(REFRESH_INTERVAL_MS)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.timeout.connect(self._flush_refresh)
+        self.upper_view_combo = QComboBox()
+        self.lower_view_combo = QComboBox()
+        self._slot_view_combos = [self.upper_view_combo, self.lower_view_combo]
+        for slot_index, combo in enumerate(self._slot_view_combos):
+            for spec in ALL_SLOT_VIEW_SPECS:
+                combo.addItem(spec.title, spec.view_id)
+            combo.currentIndexChanged.connect(lambda *_args, index=slot_index: self._slot_view_changed(index))
 
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMinimumHeight(420)
+        self.setMinimumHeight(360)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
 
-        controls = QHBoxLayout()
+        self.toolbar_primary_widget = QWidget()
+        controls = QHBoxLayout(self.toolbar_primary_widget)
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(8)
         self.preset_combo = QComboBox()
         self.preset_combo.addItem("自定义双图", "")
         for preset in PRESETS:
@@ -408,8 +425,8 @@ class RealtimeChartPanel(QWidget):
         self.auto_range_check = QCheckBox("自动缩放")
         self.auto_range_check.setChecked(True)
         self.clear_button = QPushButton("清空曲线")
-        self.cursor_label = QLabel("悬停读数：-")
-        self.cursor_label.setProperty("muted", True)
+        self.curve_settings_toggle_button = QPushButton("曲线设置")
+        self.curve_settings_toggle_button.setCheckable(True)
 
         controls.addWidget(QLabel("双图预设"))
         controls.addWidget(self.preset_combo)
@@ -417,14 +434,30 @@ class RealtimeChartPanel(QWidget):
         controls.addWidget(self.window_combo)
         controls.addWidget(self.auto_range_check)
         controls.addWidget(self.clear_button)
+        controls.addWidget(self.curve_settings_toggle_button)
         controls.addStretch(1)
-        controls.addWidget(self.cursor_label)
-        layout.addLayout(controls)
+        layout.addWidget(self.toolbar_primary_widget)
 
-        self.hint_label = QLabel("上图和下图都可以独立切换显示内容。")
-        self.hint_label.setWordWrap(True)
-        self.hint_label.setProperty("muted", True)
-        layout.addWidget(self.hint_label)
+        self.toolbar_status_widget = QWidget()
+        toolbar_status_layout = QHBoxLayout(self.toolbar_status_widget)
+        toolbar_status_layout.setContentsMargins(0, 0, 0, 0)
+        toolbar_status_layout.setSpacing(8)
+        self.status_badge_label = QLabel("")
+        self.status_badge_label.setWordWrap(True)
+        self.status_badge_label.setProperty("muted", True)
+        self.cursor_label = QLabel("悬停读数：-")
+        self.cursor_label.setWordWrap(True)
+        self.cursor_label.setProperty("muted", True)
+        toolbar_status_layout.addWidget(self.status_badge_label, 1)
+        toolbar_status_layout.addWidget(self.cursor_label, 1)
+        layout.addWidget(self.toolbar_status_widget)
+
+        self.slot_hint_label = QLabel("上图和下图都可以独立切换显示内容。")
+        self.slot_hint_label.setProperty("muted", True)
+        self.slot_hint_label.setWordWrap(True)
+        layout.addWidget(self.slot_hint_label)
+        self.curve_settings_panel = self._build_curve_settings_panel()
+        layout.addWidget(self.curve_settings_panel)
 
         pg.setConfigOptions(antialias=False)
 
@@ -439,9 +472,11 @@ class RealtimeChartPanel(QWidget):
         self.window_combo.currentIndexChanged.connect(lambda *_: self.request_refresh(immediate=True))
         self.auto_range_check.toggled.connect(lambda *_: self.request_refresh(immediate=True))
         self.clear_button.clicked.connect(self.clear)
+        self.curve_settings_toggle_button.toggled.connect(self._set_curve_settings_visible)
 
         self._sync_slot_combos()
         self.apply_theme(self._theme_name)
+        self._refresh_status_badge()
         self.request_refresh(immediate=True)
 
     def available_views(self) -> list[tuple[str, str]]:
@@ -474,11 +509,37 @@ class RealtimeChartPanel(QWidget):
         self.cursor_label.setText("悬停读数：-")
         self.request_refresh(immediate=True)
 
+    def set_idle_placeholder(self, title: str, body: str) -> None:
+        self._idle_placeholder_title = str(title or "等待实时数据")
+        self._idle_placeholder_body = str(body or "请先连接设备或加载回放。")
+        self.request_refresh(immediate=True)
+
+    def reset_idle_placeholder(self) -> None:
+        self.set_idle_placeholder("等待实时数据", "请先连接设备或加载回放。")
+
+    def set_runtime_status(
+        self,
+        *,
+        stream_status: str,
+        raw_rx_seen: bool,
+        valid_frame_seen: bool,
+        parse_mode: str,
+    ) -> None:
+        self._stream_status_text = str(stream_status or "未启动")
+        self._raw_rx_seen = bool(raw_rx_seen)
+        self._valid_frame_seen = bool(valid_frame_seen)
+        self._parse_mode_text = str(parse_mode or "AUTO")
+        self._refresh_status_badge()
+
+    def status_badge_text(self) -> str:
+        return self.status_badge_label.text()
+
     def apply_theme(self, theme_name: str) -> None:
         self._theme_name = theme_name
         self._theme_tokens = get_theme_tokens(theme_name)
         for state in self._slot_states:
             self._configure_plot_widget(state.plot)
+        self._refresh_status_badge()
         for slot_index in range(len(self._slot_states)):
             self._refresh_slot(slot_index)
         self._update_global_hint()
@@ -543,6 +604,46 @@ class RealtimeChartPanel(QWidget):
         if not self._refresh_timer.isActive():
             self._refresh_timer.start()
 
+    def _build_curve_settings_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setVisible(False)
+        layout = QGridLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(6)
+
+        self.clear_upper_button = QPushButton("移除上图")
+        self.clear_lower_button = QPushButton("移除下图")
+        self.restore_defaults_button = QPushButton("恢复默认视图")
+        self.upper_summary_label = QLabel("--")
+        self.upper_summary_label.setWordWrap(True)
+        self.upper_summary_label.setProperty("muted", True)
+        self.lower_summary_label = QLabel("--")
+        self.lower_summary_label.setWordWrap(True)
+        self.lower_summary_label.setProperty("muted", True)
+        self.curve_settings_hint_label = QLabel("")
+        self.curve_settings_hint_label.setWordWrap(True)
+        self.curve_settings_hint_label.setProperty("muted", True)
+
+        layout.addWidget(QLabel("上图视图"), 0, 0)
+        layout.addWidget(self.upper_view_combo, 0, 1)
+        layout.addWidget(self.clear_upper_button, 0, 2)
+        layout.addWidget(QLabel("下图视图"), 1, 0)
+        layout.addWidget(self.lower_view_combo, 1, 1)
+        layout.addWidget(self.clear_lower_button, 1, 2)
+        layout.addWidget(self.restore_defaults_button, 0, 3, 2, 1)
+        layout.addWidget(QLabel("上图摘要"), 2, 0)
+        layout.addWidget(self.upper_summary_label, 2, 1, 1, 3)
+        layout.addWidget(QLabel("下图摘要"), 3, 0)
+        layout.addWidget(self.lower_summary_label, 3, 1, 1, 3)
+        layout.addWidget(self.curve_settings_hint_label, 4, 0, 1, 4)
+
+        self.clear_upper_button.clicked.connect(lambda _checked=False: self.clear_slot(0))
+        self.clear_lower_button.clicked.connect(lambda _checked=False: self.clear_slot(1))
+        self.restore_defaults_button.clicked.connect(self.restore_default_views)
+        self._refresh_settings_summary()
+        return panel
+
     def _build_slot(self, *, slot_index: int, slot_name: str) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -551,13 +652,10 @@ class RealtimeChartPanel(QWidget):
 
         header = QHBoxLayout()
         header.addWidget(QLabel(slot_name))
-        combo = QComboBox()
-        for spec in ALL_SLOT_VIEW_SPECS:
-            combo.addItem(spec.title, spec.view_id)
-        header.addWidget(combo, 1)
         note_label = QLabel("")
         note_label.setProperty("muted", True)
-        header.addWidget(note_label, 2)
+        note_label.setWordWrap(True)
+        header.addWidget(note_label, 1)
         layout.addLayout(header)
 
         plot_stack = QStackedWidget()
@@ -565,10 +663,10 @@ class RealtimeChartPanel(QWidget):
         placeholder.setAlignment(Qt.AlignCenter)
         placeholder.setWordWrap(True)
         placeholder.setTextFormat(Qt.RichText)
-        placeholder.setMinimumHeight(180)
+        placeholder.setMinimumHeight(144)
 
         plot = pg.PlotWidget()
-        plot.setMinimumHeight(200)
+        plot.setMinimumHeight(160)
         plot.showGrid(x=True, y=True, alpha=0.25)
         plot.addLegend(offset=(8, 8))
         plot.setMenuEnabled(False)
@@ -590,12 +688,11 @@ class RealtimeChartPanel(QWidget):
         layout.addWidget(plot_stack, 1)
 
         plot.scene().sigMouseMoved.connect(self._mouse_moved_factory(slot_index))
-        combo.currentIndexChanged.connect(lambda *_: self._slot_view_changed(slot_index))
 
         state = SlotState(
             slot_index=slot_index,
             slot_name=slot_name,
-            combo=combo,
+            combo=self._slot_view_combos[slot_index],
             plot=plot,
             plot_stack=plot_stack,
             placeholder=placeholder,
@@ -638,6 +735,7 @@ class RealtimeChartPanel(QWidget):
         else:
             self.preset_combo.setCurrentIndex(self.preset_combo.findData(matched.preset_id))
         self.preset_combo.blockSignals(False)
+        self._refresh_settings_summary()
 
     def _flush_refresh(self, *, force: bool = False) -> None:
         if not force and not any(self._slot_refresh_dirty):
@@ -656,7 +754,7 @@ class RealtimeChartPanel(QWidget):
         times = list(self._times)
         visible_times, start_index = self._visible_times(times)
         state.plot.setLabel("left", spec.y_label, units=spec.units, color=self._theme_tokens.chart_text)
-        state.note_label.setText(spec.summary)
+        state.note_label.setText(self.slot_summary_text(slot_index))
         state.plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=self.auto_range_check.isChecked())
 
         sample_has_data = [False] * len(visible_times)
@@ -687,8 +785,12 @@ class RealtimeChartPanel(QWidget):
             seen_field_count=seen_field_count,
             visible_sample_count=len(valid_times),
         )
-        placeholder_title = state_result.placeholder_title or f"{spec.title} 暂无可绘制数据"
-        placeholder_body = state_result.placeholder_body or "请切换视图或等待更多数据。"
+        if not times:
+            placeholder_title = self._idle_placeholder_title
+            placeholder_body = self._idle_placeholder_body
+        else:
+            placeholder_title = state_result.placeholder_title or f"{spec.title} 暂无可绘制数据"
+            placeholder_body = state_result.placeholder_body or "请切换视图或等待更多数据。"
         state.placeholder.setText(placeholder_html(placeholder_title, placeholder_body, theme=self._theme_name))
         state.plot_stack.setCurrentIndex(1 if state_result.show_plot else 0)
         if state_result.show_plot:
@@ -699,7 +801,30 @@ class RealtimeChartPanel(QWidget):
     def _update_global_hint(self) -> None:
         upper_title = VIEW_BY_ID[self._slot_view_ids[0]].title
         lower_title = VIEW_BY_ID[self._slot_view_ids[1]].title
-        self.hint_label.setText(f"上图：{upper_title} | 下图：{lower_title}")
+        self.slot_hint_label.setText(f"上图：{upper_title} | 下图：{lower_title}")
+        if hasattr(self, "curve_settings_hint_label"):
+            self.curve_settings_hint_label.setText("调整上下图组合仅影响当前监测视图，不会发送任何设备命令。")
+
+    def _refresh_status_badge(self) -> None:
+        raw_text = "有" if self._raw_rx_seen else "无"
+        frame_text = "有" if self._valid_frame_seen else "无"
+        self.status_badge_label.setText(
+            f"实时流：{self._stream_status_text} | RX：{raw_text} | 有效帧：{frame_text} | 解析：{self._parse_mode_text}"
+        )
+
+    def _refresh_settings_summary(self) -> None:
+        if hasattr(self, "upper_summary_label"):
+            self.upper_summary_label.setText(self.slot_summary_text(0))
+        if hasattr(self, "lower_summary_label"):
+            self.lower_summary_label.setText(self.slot_summary_text(1))
+        self._update_global_hint()
+
+    def _set_curve_settings_visible(self, visible: bool) -> None:
+        self.curve_settings_panel.setVisible(visible)
+        self.curve_settings_toggle_button.blockSignals(True)
+        self.curve_settings_toggle_button.setChecked(visible)
+        self.curve_settings_toggle_button.setText("收起曲线设置" if visible else "曲线设置")
+        self.curve_settings_toggle_button.blockSignals(False)
 
     def _visible_times(self, times: Sequence[float]) -> tuple[list[float], int]:
         if not times:

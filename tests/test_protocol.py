@@ -66,6 +66,21 @@ class ProtocolTests(unittest.TestCase):
         parsed = YGasProtocol.parse_line(second[0])
         self.assertIsNotNone(parsed)
 
+    def test_stream_buffer_flushes_wrapped_ack_without_crlf(self) -> None:
+        buffer = StreamBuffer()
+
+        first = buffer.feed("<YGAS,012,")
+        second = buffer.feed("T>")
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, ["<YGAS,012,T>"])
+        self.assertTrue(YGasProtocol.is_ack(second[0]))
+
+    def test_split_stream_lines_supports_multiple_wrapped_records_without_crlf(self) -> None:
+        lines = YGasProtocol.split_stream_lines("<YGAS,012,T><YGAS,012,2>")
+
+        self.assertEqual(lines, ["<YGAS,012,T>", "<YGAS,012,2>"])
+
     def test_status_decode_marks_alarm_bits(self) -> None:
         decoded = YGasProtocol.decode_status("3009")
         active_bits = {item.bit for item in decoded if item.active}
@@ -90,6 +105,12 @@ class ProtocolTests(unittest.TestCase):
             YGasProtocol.parse_setting_value_reply("<YGAS,012,49>"),
             {"device_id": "012", "value": "49", "values": ["49"]},
         )
+
+    def test_classify_line_distinguishes_ack_query_and_telemetry(self) -> None:
+        self.assertEqual(YGasProtocol.classify_line("<YGAS,012,T>"), "ack")
+        self.assertEqual(YGasProtocol.classify_line("<YGAS,012,2>"), "mode_value")
+        self.assertEqual(YGasProtocol.classify_line("<YGAS,012,115200,8,N,1>"), "serial_config")
+        self.assertEqual(YGasProtocol.classify_line(self.MODE2_LINE), "telemetry")
 
 
 if __name__ == "__main__":

@@ -1,234 +1,48 @@
-# 专业气体分析仪工作站 RC-1
+# GasAxis Studio
 
-这是一个独立的 Windows 桌面上位机软件，用于 YGAS 气体分析仪的实时监测、只读联调、正式控制、原始帧诊断、CSV 回放、会话归档和诊断包导出。
+气体分析仪实时数据读取与联调平台  
+Gas Analyzer Monitoring & Commissioning Platform
 
-当前版本定位为 `RC-1`：
-- 保持 Beta-2 的监测、控制、回放、导出和权限体系
-- 继续收口真机联调稳定性、诊断可追溯性、设置迁移和 Windows 打包交付
-- 与任何 V1/V2 自动标定主流程无耦合
+`GasAxis Studio` 是面向气体分析仪现场场景的 Windows 桌面软件，主定位是“实时数据读取软件”。默认主流程是：
 
-## 主要能力
+连接成功 -> 自动启动实时流 -> 监测页出现 CO2 / H2O / 温度 / 压力数据 -> 曲线开始滚动
 
-- 实时监测页：大字数值卡片、实时曲线、状态位解码、原始帧查看、异常摘要
-- 设备控制页：按业务意图组织命令，支持查询、写入、命令预览、权限与 FFF 风险控制
-- 系数中心：`GETCO`、`SENCO1~9`、`CLEARSENCOx` 等正式命令入口
-- 信号与滤波：`SETPOW`、`SETCO2`、`TIMEOUT`、`SENTEMP1/2`、`AVERAGE1/2`
-- 专家终端：原始命令调试、抓包和响应查看
-- 数据导出与回放：结构化 CSV、会话包、诊断包、轻量真实回放
-- 真机联调辅助：安全握手、只读会话锁、自动重连、串口诊断、会话备注、日志目录打开、环境信息复制
+## 当前主流程
 
-## 技术栈
+- 默认会话模式：实时监测模式。
+- 默认采集方式：自动上传 / `LISTEN`。
+- 默认解析模式：`AUTO`。
+- 在真实串口、非回放、目标为明确三位设备 ID、非 `FFF`、且未开启严格只读 / 严格只听时，连接成功后软件只会自动发送 `SETCOMWAY=1`。
+- 自动启动实时流只用于启动主动上传，不会自动发送 `MODE`、`FTD`、`SENCO`、`ID`、`SETCOM`、`AVERAGE` 或任何自定义命令。
+- 监测页保留主按钮 `启动实时流` / `重新启动实时流`，并通过 `诊断` 下拉收纳 `切换解析模式为自动识别`、`读取关键配置`、`打开串口日志`。
 
-- Python 3.11+
-- PySide6
-- pyqtgraph
-- pyserial
-- pandas
+## 现场试用注意事项
 
-## 目录结构
+- 实时监测模式下，连接成功后软件会自动向明确目标设备发送 `SETCOMWAY=1`，用于启动主动上传；该动作不会修改 `MODE`、`FTD`、`SENCO`、`ID` 或其他校准参数。
+- 严格只读或严格只听模式下，软件不会自动发送任何命令。
+- `FFF` 是广播地址。为避免影响总线上所有设备，系统不会自动广播启动主动上传。
+- “暂停上传后读取”不会停止设备测量，只会临时发送 `SETCOMWAY=0` 暂停主动上传，读取完成后再按原状态决定是否恢复。
+- 所有写入类快捷动作仍然只做预填、定位或跳转，不会绕过命令卡确认、权限校验、只读锁或目标设备一致性校验。
+- 现场结束前，优先导出会话包作为完整留档；最近数据 CSV 仅适合快速查看最近缓存。
 
-```text
-.
-├─ main.py
-├─ requirements.txt
-├─ README.md
-├─ YGasWorkstation.spec
-├─ build_windows.ps1
-├─ assets/
-├─ tests/
-└─ ygas_monitor/
-   ├─ app.py
-   ├─ config.py
-   ├─ version.py
-   ├─ models.py
-   ├─ commanding/
-   ├─ protocols/
-   ├─ serial/
-   ├─ services/
-   └─ ui/
-```
+## 如果没有曲线
 
-## 安装依赖
+- 未连接：先确认串口、波特率和连接状态。
+- 已连接但未启动实时流：检查当前是否为自动上传模式，以及“连接后自动启动实时流”是否开启。
+- 启动实时流失败：检查目标设备 ID、波特率、线缆和设备响应。
+- `SETCOMWAY=1` ACK 成功但无有效帧：检查设备是否实际输出数据、解析模式是否匹配、线缆是否稳定。
+- 收到原始 RX 但无有效帧：优先使用 `AUTO` 解析模式，再检查设备输出是 `MODE1` 还是 `MODE2`。
+- 已加载回放但无曲线：检查回放 CSV 是否包含可识别的有效数据列。
 
-建议 Python 3.11 或更高版本。
+## 打包与交付
 
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+- Source 包：`dist/GasAxisStudio_Source_v<APP_VERSION>.zip`
+- FieldTrial 包：`dist/GasAxisStudio_FieldTrial_v<APP_VERSION>.zip`
+- FieldTrial 外部校验文件：`dist/GasAxisStudio_FieldTrial_v<APP_VERSION>.zip.sha256`
+- `SHA256SUMS.txt` 只放在 FieldTrial 包顶层，用于校验 Source zip 和现场资料文件。
+- 对外分发只使用 FieldTrial zip；不要直接分发工作区压缩包。
 
-## 本地运行
+## 历史资料归档
 
-```powershell
-python main.py
-```
-
-推荐联调顺序：
-
-1. 打开软件后默认进入“实时监测”
-2. 在顶部快速连接区选择串口和波特率
-3. 联调模式优先选“只监听”或“安全握手”
-4. 点击“连接”
-5. 如需只读探测，点击“安全握手”
-6. 确认 ID、MODE、FTD、串口参数后，再按需切到“工程模式”
-
-## 联调模式说明
-
-- 只监听：绝不主动发命令，只接收实时流
-- 安全握手：只允许查询类命令；内置安全握手按钮会读取 `ID / MODE / FTD / SETCOM`
-- 工程模式：允许正式控制命令，但仍受权限等级、只读锁和 FFF 策略约束
-- 只读会话锁：全局禁止写命令，即使切页也不能误发写入类命令
-
-## 运行期目录
-
-发布版不再依赖项目源码目录下的 `data/`、`logs/`、`exports/`。
-
-Windows 默认目录：
-
-- 设置目录：`%APPDATA%\YGasWorkstation\`
-  - `user_settings.json`
-  - `command_templates.json`
-- 日志目录：`%LOCALAPPDATA%\YGasWorkstation\logs\`
-- 导出目录：`%LOCALAPPDATA%\YGasWorkstation\exports\`
-- 缓存目录：`%LOCALAPPDATA%\YGasWorkstation\cache\`
-  - `replay\`
-
-首次启动会自动创建这些目录。若检测到旧版项目目录中的 `data/user_settings.json`，会尝试一次性迁移；配置损坏时自动回退默认值，不会导致程序崩溃。
-
-## 导出说明
-
-### 1. 结构化 CSV
-
-导出当前会话缓存的解析数据。
-
-### 2. 会话包
-
-会话包目录命名格式：
-
-```text
-session_YYYYMMDD_HHMMSS
-```
-
-内容至少包含：
-
-- `structured_data.csv`
-- `raw_frames.log`
-- `command_log.tsv`
-- `config_snapshot.json`
-- `session_summary.json`
-- `session_summary.txt`
-- `session_logger.log`（若当前会话已生成日志文件）
-
-### 3. 诊断包
-
-诊断包用于现场排障，内容至少包含：
-
-- `app_info.json`
-- `config_snapshot.json`
-- `recent_session_summary.json`
-- `recent_raw_frames.log`
-- `recent_command_log.tsv`
-- `recent_exceptions.log`
-- `session_note.txt`
-- `session_logger.log`（若存在）
-
-## 回放说明
-
-回放页支持：
-
-- 加载 CSV
-- 开始 / 暂停
-- 1x / 2x / 5x
-- 进度条拖动
-- 单步前进 / 单步后退
-- 跳到开头 / 跳到末尾
-
-回放开始时会清空并重建：
-
-- 数据卡片
-- 曲线
-- 状态面板
-- 事件时间线
-- 原始帧视图
-
-回放期间禁止向真实串口发送命令。
-
-## Windows 打包
-
-当前优先保证 `onedir` 交付稳定性。
-
-### 方式一：直接用 spec
-
-```powershell
-pip install pyinstaller
-pyinstaller --noconfirm .\YGasWorkstation.spec
-```
-
-### 方式二：使用构建脚本
-
-```powershell
-.\build_windows.ps1
-```
-
-构建脚本会：
-
-1. 清理旧的 `build/` 和 `dist/`
-2. 清理工作区内 `__pycache__/`
-3. 安装 `pyinstaller`
-4. 依据 `YGasWorkstation.spec` 生成发布目录
-
-默认产物目录：
-
-```text
-dist\YGasWorkstation\
-```
-
-如果 `assets\app.ico` 不存在，仍可正常打包，只是使用默认图标。
-
-## 发布版构建流程
-
-建议按下面顺序执行：
-
-1. `python -m unittest discover -s tests -v`
-2. `python -m compileall main.py ygas_monitor tests`
-3. `.\build_windows.ps1`
-4. 在 `dist\YGasWorkstation\` 下做一次冷启动验证
-5. 确认发布版首次启动会自动创建 `%APPDATA%` / `%LOCALAPPDATA%` 目录
-
-## 常见问题
-
-### 串口打开失败
-
-常见原因：
-
-- 串口被其他程序占用
-- 当前账号无权限访问串口
-- 设备已拔掉或串口号变化
-
-软件会在界面中给出明确中文提示，并记录到日志。
-
-### 为什么默认不直接发初始化写命令
-
-RC-1 以真机联调安全为优先。首次接入真机时，建议先只监听或安全握手，确认设备身份和工作模式后，再进入工程模式。
-
-### 为什么 FFF 默认关闭
-
-`FFF` 是广播地址，可能同时影响多台设备。只有在明确现场隔离、权限满足、并经过二次确认后才应启用。
-
-### 回放 CSV 至少需要哪些列
-
-至少需要：
-
-- `timestamp`
-- `mode`
-- `raw`
-
-缺少关键列时，软件会给出中文错误提示。
-
-## 测试
-
-```powershell
-python -m unittest discover -s tests -v
-python -m compileall main.py ygas_monitor tests
-```
+- 历史现场资料已归档到 `docs/archive/` 下的版本目录。
+- 归档资料只用于追溯，不属于当前 rc5 正式交付资料。

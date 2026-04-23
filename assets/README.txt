@@ -1,2 +1,5 @@
-Place `app.ico` here to brand the packaged Windows executable.
-If no icon is provided, the application still runs and builds normally.
+Formal product icon resources for GasAxis Studio.
+
+- Required: app.ico
+- Optional source asset: app.png
+- Windows packaging explicitly reads assets/app.ico

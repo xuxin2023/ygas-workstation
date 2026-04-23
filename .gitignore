@@ -21,6 +21,7 @@ dist/
 data/
 logs/
 exports/
+review_snapshot/
 *.log
 
 # OS / editor

@@ -4,10 +4,13 @@ from pathlib import Path
 
 
 project_root = Path.cwd()
-icon_path = project_root / "assets" / "app.ico"
+assets_dir = project_root / "assets"
+icon_path = assets_dir / "app.ico"
+
+if not icon_path.exists():
+    raise FileNotFoundError(f"Missing required application icon: {icon_path}")
 
 datas = []
-assets_dir = project_root / "assets"
 if assets_dir.exists():
     datas.append((str(assets_dir), "assets"))
 
@@ -33,7 +36,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="YGasWorkstation",
+    name="GasAxisStudio",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -44,7 +47,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=str(icon_path) if icon_path.exists() else None,
+    icon=str(icon_path),
 )
 
 coll = COLLECT(
@@ -54,5 +57,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="YGasWorkstation",
+    name="GasAxisStudio",
 )

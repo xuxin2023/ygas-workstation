@@ -8,7 +8,7 @@ from pathlib import Path
 import shutil
 from typing import Any
 
-from ..commanding.safety import SESSION_MODE_SAFE_HANDSHAKE
+from ..commanding.safety import SESSION_MODE_MONITORING
 from ..config import (
     DATA_DIR,
     EXPORT_DIR,
@@ -33,16 +33,17 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "parity": "N",
         "stopbits": "1",
         "acquisition_mode": "LISTEN",
-        "mode_preference": "MODE2",
-        "session_mode": SESSION_MODE_SAFE_HANDSHAKE,
+        "mode_preference": "AUTO",
+        "session_mode": SESSION_MODE_MONITORING,
         "command_timeout_ms": "2000",
         "auto_reconnect": False,
+        "auto_start_stream_after_connect": True,
         "profile_name": "bench_default",
         "stream_hz": "10",
         "poll_interval_ms": "200",
         "permission_level": "READ_ONLY",
         "listen_only": False,
-        "read_only_lock": True,
+        "read_only_lock": False,
         "show_expert_terminal": False,
         "target_id": "001",
         "session_note": "",

@@ -1,5 +1,5 @@
-"""YGAS analyzer desktop monitor package."""
+"""GasAxis Studio desktop application package."""
 
 __all__ = ["__version__"]
 
-__version__ = "0.1.0"
+from .version import APP_VERSION as __version__

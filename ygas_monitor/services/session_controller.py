@@ -10,26 +10,20 @@ from typing import Any
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
+from ..commanding.permissions import has_permission, permission_label
+from ..commanding.safety import SESSION_MODE_ENGINEERING, SESSION_MODE_LISTEN_ONLY, SESSION_MODE_REPLAY
 from ..config import DEFAULT_HISTORY_SIZE
-from ..models import AlarmEvent, CommandResult, ParsedFrame, RawFrameRecord, SessionConfig
+from ..models import AlarmEvent, CommandResult, ParsedFrame, RawFrameRecord, SessionConfig, action_label_zh
 from ..protocols.senco_format import normalize_senco_coefficient
-from ..protocols.ygas import CommandEnvelope, YGasProtocol
+from ..protocols.ygas import CommandEnvelope, PARSE_MODE_AUTO, StreamBuffer, YGasProtocol
 from ..serial.transport import AbstractTransport, create_transport
+from .auto_silence_policy import AutoSilencePolicy, AutoSilenceTargetResolutionError
 from .export_service import export_frames_to_csv
 from .logging_service import SessionLogger
 from .metrics import MetricsTracker, MonitoringMetrics
 
 ACTIVE_RX_WINDOW_S = 1.5
 SILENCE_WINDOW_S = 0.35
-SILENCE_REQUIRED_CODES = {
-    "GETCO",
-    "MODE",
-    "FTD",
-    "AVERAGE1",
-    "AVERAGE2",
-    "SENTEMP1",
-    "SENTEMP2",
-}
 WRITE_OBJECT_GUARD_CODES = {
     "MODE",
     "SETCOMWAY",
@@ -44,6 +38,10 @@ WRITE_OBJECT_GUARD_CODES = {
     "AVERAGE1",
     "AVERAGE2",
 }
+AUTO_UPLOAD_PAUSE_SOURCE_PAGE = "主动上传暂停保护"
+AUTO_UPLOAD_RESTORE_SOURCE_PAGE = "恢复主动上传"
+AUTO_START_STREAM_SOURCE_PAGE = "连接后自动启动实时流"
+MANUAL_STREAM_START_SOURCE_PAGE = "监测页启动实时流"
 
 
 @dataclass(slots=True)
@@ -51,6 +49,8 @@ class _PendingCommand:
     envelope: CommandEnvelope
     expectation: str
     new_target_id: str | None = None
+    expected_response_device_id: str = ""
+    operation_context: dict[str, Any] = field(default_factory=dict)
 
     @property
     def code(self) -> str:
@@ -69,10 +69,16 @@ class _PendingCommand:
         return self.code.startswith(("SENCO", "CLEARSENCO"))
 
     @property
-    def requires_silence(self) -> bool:
-        if self.code in SILENCE_REQUIRED_CODES or self.is_senco_write:
-            return True
-        return self.code == "SETCOMWAY" and bool(self.args) and self.args[0] == "0"
+    def requires_pre_silence_for_write(self) -> bool:
+        return AutoSilencePolicy.requires_pre_silence_for_write(self.code, self.operation_context, self.envelope)
+
+    @property
+    def requires_quiet_window_for_read(self) -> bool:
+        return AutoSilencePolicy.requires_quiet_window_for_read(self.code, self.operation_context, self.envelope)
+
+    @property
+    def is_silence_command(self) -> bool:
+        return AutoSilencePolicy.is_silence_command(self.code, self.operation_context, self.envelope)
 
     @property
     def is_getco(self) -> bool:
@@ -83,8 +89,14 @@ class _PendingCommand:
         return self.target_id == "FFF" and self.expectation == "ack"
 
     @property
+    def effective_scope(self) -> str:
+        return AutoSilencePolicy.effective_scope(self.target_id)
+
+    @property
     def requires_object_consistency(self) -> bool:
-        return self.code in WRITE_OBJECT_GUARD_CODES or self.code.startswith(("SENCO", "CLEARSENCO"))
+        if self.code.startswith(("SENCO", "CLEARSENCO")):
+            return True
+        return self.code in WRITE_OBJECT_GUARD_CODES and bool(self.args)
 
 
 @dataclass(slots=True)
@@ -115,6 +127,7 @@ class AcquisitionWorker(QObject):
         self._transport: AbstractTransport | None = None
         self._config = SessionConfig()
         self._partial = ""
+        self._stream_buffer = StreamBuffer()
         self._logger: SessionLogger | None = None
         self._known_ids: set[str] = set()
         self._active_rx_entries: deque[tuple[float, str]] = deque()
@@ -122,6 +135,7 @@ class AcquisitionWorker(QObject):
         self._latest_rx_device_id: str | None = None
         self._last_alarm_bits: set[int] = set()
         self._last_frame: ParsedFrame | None = None
+        self._last_stream_frame_monotonic = 0.0
         self._metrics = MetricsTracker()
         self._last_metrics_emit_ts = 0.0
         self._next_poll_ts = 0.0
@@ -132,7 +146,7 @@ class AcquisitionWorker(QObject):
     def open_session(self, config: SessionConfig) -> None:
         self.close_session()
         self._config = config
-        self._metrics.update_expected_hz(config.stream_hz)
+        self._metrics.update_expected_hz(max(1, int(config.expected_receive_hz or config.stream_hz or 1)))
         self._logger = SessionLogger(config.session_name)
         try:
             self._transport = create_transport(config.serial)
@@ -143,7 +157,9 @@ class AcquisitionWorker(QObject):
             self._latest_rx_device_id = None
             self._last_alarm_bits.clear()
             self._last_frame = None
+            self._last_stream_frame_monotonic = 0.0
             self._partial = ""
+            self._stream_buffer.clear()
             self._pending_id_target = None
             self._next_poll_ts = time.monotonic()
             self._pending_poll_deadline = 0.0
@@ -171,7 +187,7 @@ class AcquisitionWorker(QObject):
     @Slot(object)
     def update_session_config(self, config: SessionConfig) -> None:
         self._config = config
-        self._metrics.update_expected_hz(config.stream_hz)
+        self._metrics.update_expected_hz(max(1, int(config.expected_receive_hz or config.stream_hz or 1)))
         self._emit_info(
             f"会话配置已更新，目标设备 ID: {config.target_id}，解析模式 {config.mode_preference}，"
             f"会话模式: {config.session_mode}。"
@@ -179,62 +195,41 @@ class AcquisitionWorker(QObject):
 
     @Slot()
     def initialize_capture(self) -> None:
-        if not self._transport or not self._transport.is_open:
-            self.error.emit("尚未连接设备。")
-            return
-        if self._config.listen_only:
-            self.command_completed.emit(
-                CommandResult(
-                    timestamp=datetime.now(),
-                    command="INIT",
-                    ok=False,
-                    message="当前为只监听模式，未发送初始化命令。",
-                )
+        self.command_completed.emit(
+            CommandResult(
+                timestamp=datetime.now(),
+                command="INIT",
+                ok=False,
+                message=(
+                    "初始化采集入口已改为待确认清单；当前不会直接发送 MODE / FTD / SETCOMWAY。"
+                    "请在界面中准备初始化采集清单后逐项确认。"
+                ),
             )
-            return
+        )
 
-        timeout_ms = max(500, int(self._config.command_timeout_ms))
-        sequence: list[tuple[str, str, int]] = []
-        write_target = "FFF"
-        if self._config.mode_preference == "MODE1":
-            sequence.append((YGasProtocol.build_command("MODE", "1", target_id=write_target), "ack", timeout_ms))
-        elif self._config.mode_preference == "MODE2":
-            sequence.append((YGasProtocol.build_command("MODE", "2", target_id=write_target), "ack", timeout_ms))
-
-        if self._config.acquisition_mode == "LISTEN":
-            sequence.append((YGasProtocol.build_command("FTD", str(self._config.stream_hz), target_id=write_target), "ack", timeout_ms))
-            sequence.append((YGasProtocol.build_command("SETCOMWAY", "1", target_id=write_target), "ack", timeout_ms))
-        else:
-            sequence.append((YGasProtocol.build_command("SETCOMWAY", "0", target_id=write_target), "ack", timeout_ms))
-
-        for payload, expectation, payload_timeout in sequence:
-            result = self._send_payload(payload, expectation=expectation, timeout_ms=payload_timeout)
-            self.command_completed.emit(result)
-            if not result.ok:
-                return
-
-    @Slot(str, str, int)
-    def send_payload(self, payload: str, expectation: str, timeout_ms: int) -> None:
-        result = self._send_payload(payload, expectation=expectation, timeout_ms=timeout_ms)
+    @Slot(str, str, int, object)
+    def send_payload(self, payload: str, expectation: str, timeout_ms: int, context: object = None) -> None:
+        result = self._send_payload(payload, expectation=expectation, timeout_ms=timeout_ms, context=context)
         self.command_completed.emit(result)
 
-    def _send_payload(self, payload: str, *, expectation: str, timeout_ms: int) -> CommandResult:
+    def _send_payload(self, payload: str, *, expectation: str, timeout_ms: int, context: object = None) -> CommandResult:
         if not self._transport or not self._transport.is_open:
-            return CommandResult(
-                timestamp=datetime.now(),
-                command=payload,
+            return self._command_result(
+                payload,
                 ok=False,
                 message="串口未连接。",
             )
 
         envelope = YGasProtocol.parse_command(payload)
         if envelope is None:
-            return CommandResult(timestamp=datetime.now(), command=payload, ok=False, message="原始命令格式无法识别。")
+            return self._command_result(payload, ok=False, message="原始命令格式无法识别。")
 
         pending = _PendingCommand(
             envelope=envelope,
             expectation=expectation,
             new_target_id=envelope.args[0] if envelope.code == "ID" and envelope.args else None,
+            expected_response_device_id=self._snapshot_expected_response_device_id(envelope),
+            operation_context=dict(context) if isinstance(context, dict) else {},
         )
         if pending.new_target_id:
             self._pending_id_target = pending.new_target_id
@@ -243,9 +238,9 @@ class AcquisitionWorker(QObject):
         if mismatch:
             if pending.new_target_id:
                 self._pending_id_target = None
-            return CommandResult(timestamp=datetime.now(), command=payload, ok=False, message=mismatch)
+            return self._command_result(payload, ok=False, message=mismatch, pending=pending)
 
-        if pending.code == "SETCOMWAY" and pending.args[:1] == ["0"]:
+        if pending.is_silence_command:
             result = self._write_and_wait(payload, pending, timeout_ms=timeout_ms)
             if not result.ok:
                 if "超时" in result.message:
@@ -253,70 +248,417 @@ class AcquisitionWorker(QObject):
                 if pending.new_target_id:
                     self._pending_id_target = None
                 return result
-            silence_error = self._observe_silence_failure()
+            silence_error = self._observe_silence_failure(initial_lines=result.response_lines)
             if silence_error:
                 if pending.new_target_id:
                     self._pending_id_target = None
-                return CommandResult(
-                    timestamp=datetime.now(),
-                    command=payload,
+                return self._command_result(
+                    payload,
                     ok=False,
                     message=silence_error,
+                    pending=pending,
                     response_lines=result.response_lines,
+                    matched_response_line=result.matched_response_line,
+                    observed_telemetry_count=result.observed_telemetry_count,
+                    observed_other_response_count=result.observed_other_response_count,
                 )
-            self._flush_input_buffer()
-            return CommandResult(
-                timestamp=datetime.now(),
-                command=payload,
+            return self._command_result(
+                payload,
                 ok=True,
-                message="ACK 成功，自动上传已关闭并确认进入静音。",
+                message="ACK 成功，主动上传已关闭，设备已进入被动读取/等待命令状态。",
+                pending=pending,
                 response_lines=result.response_lines,
+                matched_response_line=result.matched_response_line,
+                observed_telemetry_count=result.observed_telemetry_count,
+                observed_other_response_count=result.observed_other_response_count,
+                auto_upload_state="off",
             )
 
-        if pending.requires_silence:
-            silence_result = self._ensure_write_silence(timeout_ms)
+        if pending.requires_pre_silence_for_write or pending.requires_quiet_window_for_read:
+            silence_result = self._ensure_write_silence(timeout_ms, parent_command=payload, pending=pending)
             if silence_result is not None:
-                return CommandResult(
-                    timestamp=datetime.now(),
-                    command=payload,
-                    ok=False,
-                    message=silence_result.message,
-                    response_lines=silence_result.response_lines,
-                )
+                self.command_completed.emit(silence_result)
+                if not silence_result.ok:
+                    return self._command_result(
+                        payload,
+                        ok=False,
+                        message=silence_result.message,
+                        pending=pending,
+                        response_lines=silence_result.response_lines,
+                        response_kind=silence_result.response_kind,
+                        response_device_id=silence_result.response_device_id,
+                        parsed_payload=silence_result.parsed_payload,
+                        matched_response_line=silence_result.matched_response_line,
+                        timeout_reason=silence_result.timeout_reason,
+                        observed_telemetry_count=silence_result.observed_telemetry_count,
+                        observed_other_response_count=silence_result.observed_other_response_count,
+                    )
             mismatch = self._preflight_target_mismatch(pending)
             if mismatch:
                 if pending.new_target_id:
                     self._pending_id_target = None
-                return CommandResult(timestamp=datetime.now(), command=payload, ok=False, message=mismatch)
+                return self._command_result(payload, ok=False, message=mismatch, pending=pending)
 
         result = self._write_and_wait(payload, pending, timeout_ms=timeout_ms)
         if pending.new_target_id and not result.ok and self._pending_id_target == pending.new_target_id:
             self._pending_id_target = None
+        if pending.requires_quiet_window_for_read:
+            restore_attempted = self._should_restore_after_quiet_read(pending)
+            result.restore_attempted = restore_attempted
+            if restore_attempted:
+                restore_result = self._restore_auto_upload(timeout_ms, parent_command=payload, pending=pending)
+                if restore_result is not None:
+                    self.command_completed.emit(restore_result)
+                    result.restore_result = "restored" if restore_result.ok else "restore_failed"
+            else:
+                result.restore_result = self._quiet_read_restore_result_without_attempt(pending)
         return result
 
-    def _ensure_write_silence(self, timeout_ms: int) -> CommandResult | None:
-        silence_payload = YGasProtocol.build_command("SETCOMWAY", "0", target_id="FFF")
-        pending = _PendingCommand(
-            envelope=YGasProtocol.parse_command(silence_payload) or CommandEnvelope("SETCOMWAY", "FFF", ["0"]),
-            expectation="ack",
-        )
-        result = self._write_and_wait(silence_payload, pending, timeout_ms=timeout_ms)
-        if not result.ok:
-            message = "未收到 SETCOMWAY ACK。" if "超时" in result.message else result.message
-            return CommandResult(timestamp=datetime.now(), command=silence_payload, ok=False, message=message, response_lines=result.response_lines)
+    @staticmethod
+    def _normalize_auto_upload_state(value: object) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized in {"on", "off", "unknown", "temporarily_silenced"}:
+            return normalized
+        return "unknown"
 
-        silence_error = self._observe_silence_failure()
-        if silence_error:
-            return CommandResult(
-                timestamp=datetime.now(),
-                command=silence_payload,
+    def _quiet_read_original_auto_upload_state(self, pending: _PendingCommand | None) -> str:
+        if pending is None or not pending.requires_quiet_window_for_read:
+            return ""
+        return self._normalize_auto_upload_state(pending.operation_context.get("original_auto_upload_state"))
+
+    def _quiet_read_restore_policy(self, pending: _PendingCommand | None) -> str:
+        if pending is None or not pending.requires_quiet_window_for_read:
+            return ""
+        original_state = self._quiet_read_original_auto_upload_state(pending)
+        if original_state == "on":
+            return "restore_after_read"
+        if original_state == "off":
+            return "keep_off"
+        if original_state == "temporarily_silenced":
+            return "preserve_existing_silence"
+        requested_policy = str(pending.operation_context.get("restore_policy") or "").strip()
+        if requested_policy == "user_confirmed_restore":
+            return requested_policy
+        if requested_policy == "user_declined_restore":
+            return requested_policy
+        return "unknown_no_restore"
+
+    def _should_restore_after_quiet_read(self, pending: _PendingCommand | None) -> bool:
+        return self._quiet_read_restore_policy(pending) in {"restore_after_read", "user_confirmed_restore"}
+
+    def _quiet_read_restore_result_without_attempt(self, pending: _PendingCommand | None) -> str:
+        policy = self._quiet_read_restore_policy(pending)
+        mapping = {
+            "keep_off": "kept_off",
+            "preserve_existing_silence": "preserved_existing_silence",
+            "user_declined_restore": "left_unknown",
+            "unknown_no_restore": "left_unknown",
+        }
+        return mapping.get(policy, "not_attempted")
+
+    def _command_result(
+        self,
+        payload: str,
+        *,
+        ok: bool,
+        message: str,
+        pending: _PendingCommand | None = None,
+        timestamp: datetime | None = None,
+        response_lines: list[str] | None = None,
+        response_kind: str = "",
+        response_device_id: str | None = None,
+        parsed_payload: dict[str, Any] | None = None,
+        matched_response_line: str = "",
+        timeout_reason: str = "",
+        observed_telemetry_count: int = 0,
+        observed_other_response_count: int = 0,
+        action_type: str = "",
+        parent_command: str = "",
+        source_page: str = "",
+        auto_upload_state: str = "",
+        restore_attempted: bool = False,
+        restore_result: str = "",
+        parent_pending_for_context: _PendingCommand | None = None,
+    ) -> CommandResult:
+        target_id = ""
+        expected_device_id = ""
+        effective_scope = ""
+        original_auto_upload_state = ""
+        restore_policy = ""
+        context_pending = parent_pending_for_context or pending
+        operation_context = dict(context_pending.operation_context) if context_pending is not None else {}
+        resolved_action_type = str(action_type or operation_context.get("action_type") or "").strip()
+        resolved_parent_command = str(parent_command or operation_context.get("parent_command") or "").strip()
+        resolved_source_page = str(source_page or operation_context.get("source_page") or "").strip()
+        resolved_auto_upload_state = str(auto_upload_state or operation_context.get("auto_upload_state") or "").strip()
+        if pending is not None:
+            target_id = pending.target_id
+            expected_device_id = self._expected_response_device_id(pending)
+            effective_scope = pending.effective_scope
+        if context_pending is not None:
+            original_auto_upload_state = self._quiet_read_original_auto_upload_state(context_pending)
+            restore_policy = self._quiet_read_restore_policy(context_pending)
+        else:
+            envelope = YGasProtocol.parse_command(payload)
+            if envelope is not None:
+                target_id = envelope.target_id
+                effective_scope = AutoSilencePolicy.effective_scope(envelope.target_id)
+        return CommandResult(
+            timestamp=timestamp or datetime.now(),
+            command=payload,
+            ok=ok,
+            message=message,
+            response_lines=list(response_lines or []),
+            response_kind=response_kind,
+            response_device_id=response_device_id,
+            parsed_payload=dict(parsed_payload or {}),
+            matched_response_line=matched_response_line,
+            timeout_reason=timeout_reason,
+            observed_telemetry_count=observed_telemetry_count,
+            observed_other_response_count=observed_other_response_count,
+            action_type=resolved_action_type,
+            action_label_zh=action_label_zh(resolved_action_type or "command"),
+            parent_command=resolved_parent_command,
+            command_target_id=target_id,
+            expected_device_id=expected_device_id,
+            effective_scope=effective_scope,
+            source_page=resolved_source_page,
+            auto_upload_state=resolved_auto_upload_state,
+            original_auto_upload_state=original_auto_upload_state,
+            restore_policy=restore_policy,
+            restore_attempted=restore_attempted,
+            restore_result=restore_result,
+        )
+
+    def _ensure_write_silence(
+        self,
+        timeout_ms: int,
+        *,
+        parent_command: str,
+        pending: _PendingCommand,
+    ) -> CommandResult | None:
+        auto_write_error = self._can_issue_automatic_write()
+        if auto_write_error:
+            return self._command_result(
+                parent_command,
                 ok=False,
-                message=silence_error,
-                response_lines=result.response_lines,
+                message=f"暂停主动上传失败：{auto_write_error}",
+                pending=pending,
+                action_type="auto_silence",
+                parent_command=parent_command,
+                source_page=AUTO_UPLOAD_PAUSE_SOURCE_PAGE,
+                auto_upload_state="unknown",
+                restore_result="not_attempted",
+                parent_pending_for_context=pending,
             )
 
-        self._flush_input_buffer()
-        return None
+        try:
+            silence_target_id = AutoSilencePolicy.silence_target_id(
+                target_id_policy=pending.target_id,
+                expected_device_id=self._expected_response_device_id(pending),
+                active_device_ids=list(self._active_rx_cache),
+                allow_broadcast=bool(pending.operation_context.get("allow_broadcast_silence", False)),
+            )
+        except AutoSilenceTargetResolutionError as exc:
+            return self._command_result(
+                parent_command,
+                ok=False,
+                message=f"暂停主动上传失败：{exc}",
+                pending=pending,
+                action_type="auto_silence",
+                parent_command=parent_command,
+                source_page=AUTO_UPLOAD_PAUSE_SOURCE_PAGE,
+                auto_upload_state="unknown",
+                restore_result="not_attempted",
+                parent_pending_for_context=pending,
+            )
+        silence_payload = AutoSilencePolicy.silence_payload(
+            silence_target_id,
+            expected_device_id=self._expected_response_device_id(pending),
+            active_device_ids=list(self._active_rx_cache),
+            allow_broadcast=bool(pending.operation_context.get("allow_broadcast_silence", False)),
+        )
+        silence_pending = _PendingCommand(
+            envelope=YGasProtocol.parse_command(silence_payload) or CommandEnvelope("SETCOMWAY", silence_target_id, ["0"]),
+            expectation="ack",
+            expected_response_device_id=self._expected_response_device_id(pending),
+            operation_context=dict(pending.operation_context),
+        )
+        result = self._write_and_wait(silence_payload, silence_pending, timeout_ms=timeout_ms)
+        if not result.ok:
+            message = (
+                "暂停主动上传失败：未收到 SETCOMWAY ACK。"
+                if "超时" in result.message
+                else f"暂停主动上传失败：{result.message}"
+            )
+            return self._command_result(
+                silence_payload,
+                ok=False,
+                message=message,
+                pending=silence_pending,
+                timestamp=result.timestamp,
+                response_lines=result.response_lines,
+                response_kind=result.response_kind,
+                response_device_id=result.response_device_id,
+                parsed_payload=result.parsed_payload,
+                matched_response_line=result.matched_response_line,
+                timeout_reason=result.timeout_reason,
+                observed_telemetry_count=result.observed_telemetry_count,
+                observed_other_response_count=result.observed_other_response_count,
+                action_type="auto_silence",
+                parent_command=parent_command,
+                source_page=AUTO_UPLOAD_PAUSE_SOURCE_PAGE,
+                auto_upload_state="unknown",
+                restore_result="not_attempted",
+                parent_pending_for_context=pending,
+            )
+
+        silence_error = self._observe_silence_failure(initial_lines=result.response_lines)
+        if silence_error:
+            return self._command_result(
+                silence_payload,
+                ok=False,
+                message=f"暂停主动上传失败：{silence_error}",
+                pending=silence_pending,
+                timestamp=result.timestamp,
+                response_lines=result.response_lines,
+                response_kind=result.response_kind,
+                response_device_id=result.response_device_id,
+                parsed_payload=result.parsed_payload,
+                matched_response_line=result.matched_response_line,
+                observed_telemetry_count=result.observed_telemetry_count,
+                observed_other_response_count=result.observed_other_response_count,
+                action_type="auto_silence",
+                parent_command=parent_command,
+                source_page=AUTO_UPLOAD_PAUSE_SOURCE_PAGE,
+                auto_upload_state="unknown",
+                restore_result="not_attempted",
+                parent_pending_for_context=pending,
+            )
+        return self._command_result(
+            silence_payload,
+            ok=True,
+            message="ACK 成功，主动上传已临时暂停。",
+            pending=silence_pending,
+            timestamp=result.timestamp,
+            response_lines=result.response_lines,
+            response_kind=result.response_kind or "ack",
+            response_device_id=result.response_device_id,
+            parsed_payload=result.parsed_payload,
+            matched_response_line=result.matched_response_line,
+            observed_telemetry_count=result.observed_telemetry_count,
+            observed_other_response_count=result.observed_other_response_count,
+            action_type="auto_silence",
+            parent_command=parent_command,
+            source_page=AUTO_UPLOAD_PAUSE_SOURCE_PAGE,
+            auto_upload_state="temporarily_silenced" if pending.requires_quiet_window_for_read else "off",
+            restore_result=(
+                "pending_restore"
+                if self._should_restore_after_quiet_read(pending)
+                else self._quiet_read_restore_result_without_attempt(pending)
+            ),
+            parent_pending_for_context=pending,
+        )
+
+    def _restore_auto_upload(
+        self,
+        timeout_ms: int,
+        *,
+        parent_command: str,
+        pending: _PendingCommand,
+    ) -> CommandResult | None:
+        auto_write_error = self._can_issue_automatic_write()
+        if auto_write_error:
+            return self._command_result(
+                parent_command,
+                ok=False,
+                message=f"恢复主动上传失败：{auto_write_error}",
+                pending=pending,
+                action_type="auto_silence_restore",
+                parent_command=parent_command,
+                source_page=AUTO_UPLOAD_RESTORE_SOURCE_PAGE,
+                auto_upload_state="off",
+                restore_attempted=True,
+                restore_result="restore_failed",
+                parent_pending_for_context=pending,
+            )
+        try:
+            restore_payload = AutoSilencePolicy.restore_payload(
+                pending.target_id,
+                expected_device_id=self._expected_response_device_id(pending),
+                active_device_ids=list(self._active_rx_cache),
+                allow_broadcast=bool(pending.operation_context.get("allow_broadcast_silence", False)),
+            )
+        except AutoSilenceTargetResolutionError as exc:
+            return self._command_result(
+                parent_command,
+                ok=False,
+                message=f"恢复主动上传失败：{exc}",
+                pending=pending,
+                action_type="auto_silence_restore",
+                parent_command=parent_command,
+                source_page=AUTO_UPLOAD_RESTORE_SOURCE_PAGE,
+                auto_upload_state="off",
+                restore_attempted=True,
+                restore_result="restore_failed",
+                parent_pending_for_context=pending,
+            )
+        restore_pending = _PendingCommand(
+            envelope=YGasProtocol.parse_command(restore_payload) or CommandEnvelope("SETCOMWAY", pending.target_id, ["1"]),
+            expectation="ack",
+            expected_response_device_id=self._expected_response_device_id(pending),
+            operation_context=dict(pending.operation_context),
+        )
+        result = self._write_and_wait(restore_payload, restore_pending, timeout_ms=timeout_ms)
+        if not result.ok:
+            message = (
+                "恢复主动上传失败：未收到 SETCOMWAY ACK。"
+                if "超时" in result.message
+                else f"恢复主动上传失败：{result.message}"
+            )
+            return self._command_result(
+                restore_payload,
+                ok=False,
+                message=message,
+                pending=restore_pending,
+                timestamp=result.timestamp,
+                response_lines=result.response_lines,
+                response_kind=result.response_kind,
+                response_device_id=result.response_device_id,
+                parsed_payload=result.parsed_payload,
+                matched_response_line=result.matched_response_line,
+                timeout_reason=result.timeout_reason,
+                observed_telemetry_count=result.observed_telemetry_count,
+                observed_other_response_count=result.observed_other_response_count,
+                action_type="auto_silence_restore",
+                parent_command=parent_command,
+                source_page=AUTO_UPLOAD_RESTORE_SOURCE_PAGE,
+                auto_upload_state="off",
+                restore_attempted=True,
+                restore_result="restore_failed",
+                parent_pending_for_context=pending,
+            )
+        return self._command_result(
+            restore_payload,
+            ok=True,
+            message="ACK 成功，已恢复主动上传。",
+            pending=restore_pending,
+            timestamp=result.timestamp,
+            response_lines=result.response_lines,
+            response_kind=result.response_kind or "ack",
+            response_device_id=result.response_device_id,
+            parsed_payload=result.parsed_payload,
+            matched_response_line=result.matched_response_line,
+            observed_telemetry_count=result.observed_telemetry_count,
+            observed_other_response_count=result.observed_other_response_count,
+            action_type="auto_silence_restore",
+            parent_command=parent_command,
+            source_page=AUTO_UPLOAD_RESTORE_SOURCE_PAGE,
+            auto_upload_state="on",
+            restore_attempted=True,
+            restore_result="restored",
+            parent_pending_for_context=pending,
+        )
 
     def _write_and_wait(self, payload: str, pending: _PendingCommand, *, timeout_ms: int) -> CommandResult:
         try:
@@ -326,10 +668,10 @@ class AcquisitionWorker(QObject):
             message = f"命令发送失败: {exc}"
             self._handle_transport_fault(message)
             self.error.emit(message)
-            return CommandResult(timestamp=datetime.now(), command=payload, ok=False, message=message)
+            return self._command_result(payload, ok=False, message=message, pending=pending)
 
         if pending.expectation == "none":
-            return CommandResult(timestamp=datetime.now(), command=payload, ok=True, message="命令已发送。")
+            return self._command_result(payload, ok=True, message="命令已发送。", pending=pending)
         return self._wait_for_response(payload, pending=pending, timeout_ms=timeout_ms)
 
     def _wait_for_response(self, payload: str, *, pending: _PendingCommand, timeout_ms: int) -> CommandResult:
@@ -337,17 +679,43 @@ class AcquisitionWorker(QObject):
         lines_seen: list[str] = []
         mismatched_device_ids: set[str] = set()
         ack_seen = False
+        telemetry_seen = 0
+        other_response_seen = 0
+        matched_response: _ParsedResponse | None = None
+        matched_response_line = ""
+        stream_active_before_wait = self._has_recent_stream_frame()
 
         while time.monotonic() < deadline:
-            batch = self._read_batch()
+            try:
+                batch = self._read_batch()
+            except Exception as exc:
+                message = f"命令等待期间串口异常断开: {exc}"
+                self._handle_transport_fault(message)
+                self.error.emit(message)
+                return self._command_result(
+                    payload,
+                    ok=False,
+                    message="连接断开，未在等待期间收到预期响应。",
+                    pending=pending,
+                    response_lines=lines_seen[:],
+                    response_kind="transport_error",
+                    timeout_reason="transport_disconnected",
+                    observed_telemetry_count=telemetry_seen,
+                    observed_other_response_count=other_response_seen,
+                )
             if batch:
                 lines_seen.extend(batch)
                 for line in batch:
-                    frame = self._parse_frame_line(line)
+                    line_kind = YGasProtocol.classify_line(line, parse_mode=self._config.mode_preference)
+                    frame = self._parse_frame_line(line) if line_kind == "telemetry" else None
                     if frame is not None:
                         self._publish_frame(frame)
 
-                    outcome = self._parse_expected_response_structured(line, pending)
+                    outcome = self._parse_expected_response_structured(
+                        line,
+                        pending,
+                        stream_active_before_wait=stream_active_before_wait,
+                    )
                     if outcome == "ack_seen":
                         ack_seen = True
                         continue
@@ -356,121 +724,94 @@ class AcquisitionWorker(QObject):
                         continue
                     if isinstance(outcome, tuple) and outcome[0] == "result":
                         parsed = outcome[1]
-                        return CommandResult(
-                            timestamp=datetime.now(),
-                            command=payload,
-                            ok=parsed.ok,
-                            message=parsed.message,
-                            response_lines=lines_seen[:],
-                            response_kind=parsed.kind,
-                            response_device_id=parsed.device_id,
-                            parsed_payload=parsed.payload,
-                        )
+                        if matched_response is None:
+                            matched_response = parsed
+                            matched_response_line = line
+                        continue
                     if pending.expectation == "any":
-                        return CommandResult(
-                            timestamp=datetime.now(),
-                            command=payload,
-                            ok=True,
-                            message="收到设备响应。",
-                            response_lines=lines_seen[:],
-                        )
-            time.sleep(0.02)
-
-        message = self._timeout_message_for(pending, ack_seen=ack_seen, mismatched_device_ids=mismatched_device_ids, timeout_ms=timeout_ms)
-        self.error.emit(f"{payload} -> {message}")
-        return CommandResult(
-            timestamp=datetime.now(),
-            command=payload,
-            ok=False,
-            message=message,
-            response_lines=lines_seen,
-        )
-
-    def _parse_expected_response(self, line: str, pending: _PendingCommand) -> tuple[str, _ParsedResponse] | tuple[str, str] | str | None:
-        ack = YGasProtocol.parse_ack(line)
-        if ack is not None:
-            self._track_rx_device(ack.device_id, update_latest=True, source="ACK")
-            self._maybe_sync_target_from_rx(ack.device_id, source="ACK")
-            if pending.expectation == "ack":
-                if not self._matches_target(ack.device_id, pending.target_id, allow_broadcast_ack=pending.allows_broadcast_ack):
-                    return ("mismatch", ack.device_id)
-                if pending.new_target_id and ack.ok and ack.device_id == pending.new_target_id:
-                    self._sync_target_to(pending.new_target_id, source="ACK")
-                if not ack.ok:
-                    return ("result", False, f"设备返回失败 ACK: {ack.detail or 'F'}")
-                return ("result", True, "ACK 成功。")
-            if pending.expectation == "coefficient":
-                return "ack_seen"
-
-        device_id = YGasProtocol.response_device_id(line, parse_mode=self._config.mode_preference)
-        if device_id and not ack:
-            self._track_rx_device(device_id, update_latest=False, source="REPLY")
-            self._maybe_sync_target_from_rx(device_id, source="REPLY")
-
-        if pending.expectation == "data":
-            frame = self._parse_frame_line(line)
-            if frame is not None:
-                if not self._matches_target(frame.device_id or "", pending.target_id):
-                    return ("mismatch", frame.device_id or "")
-                return ("result", True, f"收到数据帧，MODE{frame.mode}。")
-
-        if pending.expectation == "coefficient":
-            coeff = YGasProtocol.parse_coefficient_reply(line)
-            if coeff is not None:
-                mismatch = self._preflight_target_mismatch(pending)
-                if mismatch:
-                    return ("result", False, mismatch)
-                suggestion = self._coefficient_suggestion(coeff)
-                message = f"收到系数响应: {coeff}"
-                if suggestion:
-                    message += f" | 建议写回格式: {suggestion}"
-                return ("result", True, message)
-
-        if pending.expectation == "serial_config":
-            serial_cfg = YGasProtocol.parse_serial_config_reply(line)
-            if serial_cfg is not None:
-                if not self._matches_target(serial_cfg["device_id"], pending.target_id):
-                    return ("mismatch", serial_cfg["device_id"])
-                return (
-                    "result",
-                    True,
-                    f"通信参数: {serial_cfg['baudrate']} / {serial_cfg['bytesize']} / {serial_cfg['parity']} / {serial_cfg['stopbits']}",
+                        if matched_response is None:
+                            matched_response = _ParsedResponse(
+                                ok=True,
+                                message="收到设备响应。",
+                                kind=line_kind or "any",
+                                device_id=YGasProtocol.response_device_id(line, parse_mode=self._config.mode_preference),
+                            )
+                            matched_response_line = line
+                        continue
+                    if line_kind == "telemetry":
+                        telemetry_seen += 1
+                    elif line_kind:
+                        other_response_seen += 1
+                continue
+            if matched_response is not None:
+                return self._command_result(
+                    payload,
+                    ok=matched_response.ok,
+                    message=matched_response.message,
+                    pending=pending,
+                    response_lines=lines_seen[:],
+                    response_kind=matched_response.kind,
+                    response_device_id=matched_response.device_id,
+                    parsed_payload=matched_response.payload,
+                    matched_response_line=matched_response_line,
+                    observed_telemetry_count=telemetry_seen,
+                    observed_other_response_count=other_response_seen,
                 )
 
-        if pending.expectation == "mode_value":
-            mode_value = YGasProtocol.parse_mode_value_reply(line)
-            if mode_value is not None:
-                if not self._matches_target(mode_value["device_id"], pending.target_id):
-                    return ("mismatch", mode_value["device_id"])
-                return ("result", True, f"当前工作模式: MODE{mode_value['mode']}")
+        if matched_response is not None:
+            return self._command_result(
+                payload,
+                ok=matched_response.ok,
+                message=matched_response.message,
+                pending=pending,
+                response_lines=lines_seen[:],
+                response_kind=matched_response.kind,
+                response_device_id=matched_response.device_id,
+                parsed_payload=matched_response.payload,
+                matched_response_line=matched_response_line,
+                observed_telemetry_count=telemetry_seen,
+                observed_other_response_count=other_response_seen,
+            )
 
-        if pending.expectation == "identity":
-            identity = YGasProtocol.parse_identity_reply(line)
-            if identity is not None:
-                if not self._matches_target(identity["device_id"], pending.target_id):
-                    return ("mismatch", identity["device_id"])
-                return ("result", True, f"当前设备 ID: {identity['device_id']}")
-
-        if pending.expectation == "setting_value":
-            value = YGasProtocol.parse_setting_value_reply(line)
-            if value is not None:
-                if not self._matches_target(value["device_id"], pending.target_id):
-                    return ("mismatch", value["device_id"])
-                return ("result", True, f"当前值: {value['value']}")
-
-        return None
+        message, timeout_reason = self._timeout_message_for(
+            pending,
+            ack_seen=ack_seen,
+            mismatched_device_ids=mismatched_device_ids,
+            timeout_ms=timeout_ms,
+            telemetry_seen=telemetry_seen,
+            other_response_seen=other_response_seen,
+        )
+        self.error.emit(f"{payload} -> {message}")
+        return self._command_result(
+            payload,
+            ok=False,
+            message=message,
+            pending=pending,
+            response_lines=lines_seen,
+            response_kind="timeout",
+            timeout_reason=timeout_reason,
+            observed_telemetry_count=telemetry_seen,
+            observed_other_response_count=other_response_seen,
+        )
 
     def _parse_expected_response_structured(
         self,
         line: str,
         pending: _PendingCommand,
+        *,
+        stream_active_before_wait: bool = False,
     ) -> tuple[str, _ParsedResponse] | tuple[str, str] | str | None:
         ack = YGasProtocol.parse_ack(line)
         if ack is not None:
             self._track_rx_device(ack.device_id, update_latest=True, source="ACK")
             self._maybe_sync_target_from_rx(ack.device_id, source="ACK")
             if pending.expectation == "ack":
-                if not self._matches_target(ack.device_id, pending.target_id, allow_broadcast_ack=pending.allows_broadcast_ack):
+                if not self._matches_target(
+                    ack.device_id,
+                    pending.target_id,
+                    allow_broadcast_ack=pending.allows_broadcast_ack,
+                    expected_device_id=self._expected_response_device_id(pending),
+                ):
                     return ("mismatch", ack.device_id)
                 if pending.new_target_id and ack.ok and ack.device_id == pending.new_target_id:
                     self._sync_target_to(pending.new_target_id, source="ACK")
@@ -489,7 +830,13 @@ class AcquisitionWorker(QObject):
                     "result",
                     _ParsedResponse(
                         ok=True,
-                        message="ACK 成功。",
+                        message=(
+                            "ACK 成功，但当前广播 ACK 归属未绑定到明确会话目标。"
+                            if pending.target_id == "FFF"
+                            and pending.allows_broadcast_ack
+                            and not self._expected_response_device_id(pending)
+                            else "ACK 成功。"
+                        ),
                         kind="ack",
                         device_id=ack.device_id,
                         payload={"detail": ack.detail or ""},
@@ -506,8 +853,14 @@ class AcquisitionWorker(QObject):
         if pending.expectation == "data":
             frame = self._parse_frame_line(line)
             if frame is not None:
-                if not self._matches_target(frame.device_id or "", pending.target_id):
+                if not self._matches_target(
+                    frame.device_id or "",
+                    pending.target_id,
+                    expected_device_id=self._expected_response_device_id(pending),
+                ):
                     return ("mismatch", frame.device_id or "")
+                if pending.code == "READDATA" and stream_active_before_wait:
+                    return None
                 return (
                     "result",
                     _ParsedResponse(
@@ -543,7 +896,11 @@ class AcquisitionWorker(QObject):
         if pending.expectation == "serial_config":
             serial_cfg = YGasProtocol.parse_serial_config_reply(line)
             if serial_cfg is not None:
-                if not self._matches_target(serial_cfg["device_id"], pending.target_id):
+                if not self._matches_target(
+                    serial_cfg["device_id"],
+                    pending.target_id,
+                    expected_device_id=self._expected_response_device_id(pending),
+                ):
                     return ("mismatch", serial_cfg["device_id"])
                 return (
                     "result",
@@ -562,7 +919,11 @@ class AcquisitionWorker(QObject):
         if pending.expectation == "mode_value":
             mode_value = YGasProtocol.parse_mode_value_reply(line)
             if mode_value is not None:
-                if not self._matches_target(mode_value["device_id"], pending.target_id):
+                if not self._matches_target(
+                    mode_value["device_id"],
+                    pending.target_id,
+                    expected_device_id=self._expected_response_device_id(pending),
+                ):
                     return ("mismatch", mode_value["device_id"])
                 return (
                     "result",
@@ -578,7 +939,11 @@ class AcquisitionWorker(QObject):
         if pending.expectation == "identity":
             identity = YGasProtocol.parse_identity_reply(line)
             if identity is not None:
-                if not self._matches_target(identity["device_id"], pending.target_id):
+                if not self._matches_target(
+                    identity["device_id"],
+                    pending.target_id,
+                    expected_device_id=self._expected_response_device_id(pending),
+                ):
                     return ("mismatch", identity["device_id"])
                 return (
                     "result",
@@ -594,7 +959,11 @@ class AcquisitionWorker(QObject):
         if pending.expectation == "setting_value":
             value = YGasProtocol.parse_setting_value_reply(line)
             if value is not None:
-                if not self._matches_target(value["device_id"], pending.target_id):
+                if not self._matches_target(
+                    value["device_id"],
+                    pending.target_id,
+                    expected_device_id=self._expected_response_device_id(pending),
+                ):
                     return ("mismatch", value["device_id"])
                 return (
                     "result",
@@ -630,14 +999,11 @@ class AcquisitionWorker(QObject):
                 self._next_poll_ts = now + max(0.05, self._config.poll_interval_ms / 1000.0)
                 self._pending_poll_deadline = now + max(1.0, self._config.command_timeout_ms / 1000.0)
 
-            latest_frame: ParsedFrame | None = None
             for line in self._read_batch():
                 frame = self._parse_frame_line(line)
                 if frame is not None:
-                    latest_frame = frame
+                    self._publish_frame(frame)
                     self._pending_poll_deadline = 0.0
-            if latest_frame is not None:
-                self._publish_frame(latest_frame)
 
             if self._pending_poll_deadline and time.monotonic() > self._pending_poll_deadline:
                 self._pending_poll_deadline = 0.0
@@ -656,17 +1022,14 @@ class AcquisitionWorker(QObject):
         chunk = self._transport.read_available()
         if not chunk:
             return []
-        text = chunk.decode("ascii", errors="ignore").replace("\r\n", "\n").replace("\r", "\n")
-        self._partial += text
-        parts = self._partial.split("\n")
-        self._partial = parts.pop() if parts else ""
-        lines = [line.strip() for line in parts if line.strip()]
+        lines = self._stream_buffer.feed(chunk)
         for line in lines:
             self._record("RX", line)
         return lines
 
     def _publish_frame(self, frame: ParsedFrame) -> None:
         self._last_frame = frame
+        self._last_stream_frame_monotonic = time.monotonic()
         self._track_rx_device(frame.device_id, update_latest=True, source="DATA")
         self._maybe_sync_target_from_rx(frame.device_id, source="DATA")
         self.frame_received.emit(frame)
@@ -687,20 +1050,29 @@ class AcquisitionWorker(QObject):
                 self.alarm_emitted.emit(event)
         self._last_alarm_bits = active_alarm_bits
 
-    def _observe_silence_failure(self) -> str | None:
+    def _observe_silence_failure(self, *, initial_lines: list[str] | None = None) -> str | None:
         deadline = time.monotonic() + SILENCE_WINDOW_S
-        stream_lines: list[str] = []
+        stream_modes: list[int] = []
+        for line in initial_lines or []:
+            frame = self._parse_telemetry_line_any_mode(line)
+            if frame is not None:
+                stream_modes.append(frame.mode)
+        if stream_modes:
+            modes = "/".join(f"MODE{mode}" for mode in sorted(set(stream_modes)))
+            return f"收到 SETCOMWAY ACK，但暂停上传窗口内仍收到实时数据帧（{modes}），主动上传未真正关闭。"
         while time.monotonic() < deadline:
-            batch = self._read_batch()
+            try:
+                batch = self._read_batch()
+            except Exception as exc:
+                return f"等待暂停上传窗口时串口异常断开：{exc}"
             for line in batch:
-                frame = self._parse_frame_line(line)
+                frame = self._parse_telemetry_line_any_mode(line)
                 if frame is not None:
                     self._publish_frame(frame)
-                    if frame.mode == 2:
-                        stream_lines.append(line)
-            if stream_lines:
-                return "收到 SETCOMWAY ACK，但静音窗口仍有 MODE2 流帧，自动上传未真正关闭。"
-            time.sleep(0.02)
+                    stream_modes.append(frame.mode)
+            if stream_modes:
+                modes = "/".join(f"MODE{mode}" for mode in sorted(set(stream_modes)))
+                return f"收到 SETCOMWAY ACK，但暂停上传窗口内仍收到实时数据帧（{modes}），主动上传未真正关闭。"
         return None
 
     def _flush_input_buffer(self) -> None:
@@ -711,6 +1083,7 @@ class AcquisitionWorker(QObject):
         except Exception:
             pass
         self._partial = ""
+        self._stream_buffer.clear()
 
     def _timeout_message_for(
         self,
@@ -719,19 +1092,42 @@ class AcquisitionWorker(QObject):
         ack_seen: bool,
         mismatched_device_ids: set[str],
         timeout_ms: int,
-    ) -> str:
-        mismatch = self._preflight_target_mismatch(pending)
-        if mismatch:
-            return mismatch
+        telemetry_seen: int,
+        other_response_seen: int,
+    ) -> tuple[str, str]:
         if mismatched_device_ids:
             online = ",".join(sorted(mismatched_device_ids))
             return (
-                f"响应来自错误设备 ID: target={self._display_target_id(pending)}，online={online}，"
-                "本次命令未判成功。"
-            )
+                f"响应来自错误设备 ID: target={self._display_target_id(pending)}，online={online}。"
+                "本次命令未判定成功。"
+            ), "mismatched_device"
+        mismatch = self._preflight_target_mismatch(pending)
+        if mismatch:
+            return mismatch, "preflight_target_mismatch"
         if pending.is_getco and ack_seen:
-            return "已静音，但 GETCO 只有 ACK、没有系数行。"
-        return f"命令超时，未在 {timeout_ms} ms 内收到预期响应。"
+            return "已暂停主动上传，但 GETCO 只有 ACK、没有系数行。", "ack_without_followup"
+        if pending.expectation == "data" and pending.code == "READDATA" and telemetry_seen > 0:
+            return (
+                "当前设备正在自动上传实时数据，READDATA 返回帧与自动流无法可靠区分。"
+                f"等待期间收到 {telemetry_seen} 条实时数据帧。"
+                "请直接查看实时数据，或先关闭主动上传后再执行 READDATA。"
+            ), "telemetry_data_ambiguous"
+        if telemetry_seen > 0 and other_response_seen <= 0:
+            return (
+                f"命令超时，等待期间持续收到 {telemetry_seen} 条实时数据帧，"
+                "但未匹配到预期响应。"
+            ), "telemetry_only_no_match"
+        if telemetry_seen > 0 and other_response_seen > 0:
+            return (
+                f"命令超时，等待期间收到 {telemetry_seen} 条实时数据帧和 {other_response_seen} 条非匹配响应，"
+                "但未匹配到预期响应。"
+            ), "telemetry_and_other_responses"
+        if other_response_seen > 0:
+            return (
+                f"命令超时，等待期间收到 {other_response_seen} 条非匹配响应，"
+                "但未匹配到预期响应。"
+            ), "other_response_no_match"
+        return f"命令超时，未在 {timeout_ms} ms 内收到预期响应。", "deadline_expired"
 
     def _coefficient_suggestion(self, coeff: dict[str, float]) -> str:
         ordered = sorted(coeff.items(), key=lambda item: int(item[0][1:]))
@@ -740,14 +1136,39 @@ class AcquisitionWorker(QObject):
             formatted.append(normalize_senco_coefficient(str(value)))
         return ",".join(formatted)
 
-    def _matches_target(self, response_device_id: str, target_id: str, *, allow_broadcast_ack: bool = False) -> bool:
+    def _matches_target(
+        self,
+        response_device_id: str,
+        target_id: str,
+        *,
+        allow_broadcast_ack: bool = False,
+        expected_device_id: str = "",
+    ) -> bool:
         if not response_device_id:
             return False
         normalized_target = str(target_id or "").strip().upper()
         normalized_response = str(response_device_id or "").strip().upper()
         if normalized_target == "FFF":
-            return allow_broadcast_ack
+            if not allow_broadcast_ack:
+                return False
+            normalized_expected = str(expected_device_id or "").strip().upper()
+            if normalized_expected:
+                return normalized_response == normalized_expected
+            return True
         return normalized_response == normalized_target
+
+    def _expected_response_device_id(self, pending: _PendingCommand) -> str:
+        return str(pending.expected_response_device_id or "").strip().upper()
+
+    def _snapshot_expected_response_device_id(self, envelope: CommandEnvelope) -> str:
+        payload_target = str(envelope.target_id or "").strip().upper()
+        if payload_target.isdigit():
+            return payload_target
+        session_target = str(self._config.target_id or "").strip().upper()
+        if session_target.isdigit():
+            return session_target
+        single_online = self._single_online_numeric_device_id()
+        return str(single_online or "").strip().upper()
 
     def _preflight_target_mismatch(self, pending: _PendingCommand) -> str:
         target = self._object_target_id(pending)
@@ -790,6 +1211,11 @@ class AcquisitionWorker(QObject):
 
     def _display_target_id(self, pending: _PendingCommand) -> str:
         return self._object_target_id(pending) or pending.target_id
+
+    def _has_recent_stream_frame(self) -> bool:
+        if self._last_stream_frame_monotonic <= 0:
+            return False
+        return (time.monotonic() - self._last_stream_frame_monotonic) <= ACTIVE_RX_WINDOW_S
 
     def _object_target_id(self, pending: _PendingCommand) -> str:
         payload_target = str(pending.target_id or "").strip().upper()
@@ -873,6 +1299,10 @@ class AcquisitionWorker(QObject):
     def _parse_frame_line(self, line: str) -> ParsedFrame | None:
         return YGasProtocol.parse_line(line, parse_mode=self._config.mode_preference)
 
+    @staticmethod
+    def _parse_telemetry_line_any_mode(line: str) -> ParsedFrame | None:
+        return YGasProtocol.parse_line(line, parse_mode=PARSE_MODE_AUTO)
+
     def _handle_transport_fault(self, message: str) -> None:
         if self._transport is not None:
             try:
@@ -882,6 +1312,15 @@ class AcquisitionWorker(QObject):
         self._transport = None
         self.connection_changed.emit(False, str(self._logger.path) if self._logger is not None else "")
         self._emit_info(message)
+
+    def _can_issue_automatic_write(self) -> str:
+        if self._config.read_only_lock:
+            return "只读锁已开启，禁止系统自动发送 SETCOMWAY。"
+        if self._config.session_mode != SESSION_MODE_ENGINEERING:
+            return "当前会话模式不允许系统自动发送 SETCOMWAY。"
+        if not has_permission(self._config.permission_level, "CONFIG"):
+            return "当前权限不足，系统不会自动发送 SETCOMWAY。"
+        return ""
 
     @staticmethod
     def _format_tx_record(payload: str) -> str:
@@ -909,12 +1348,13 @@ class AnalyzerSessionController(QObject):
     _close_requested = Signal()
     _config_requested = Signal(object)
     _init_requested = Signal()
-    _payload_requested = Signal(str, str, int)
+    _payload_requested = Signal(str, str, int, object)
 
     def __init__(self, session_name: str):
         super().__init__()
         self.session_name = session_name
         self.current_config = SessionConfig(session_name=session_name)
+        self.connected = False
         self.frames: deque[ParsedFrame] = deque(maxlen=DEFAULT_HISTORY_SIZE)
         self.raw_records: deque[RawFrameRecord] = deque(maxlen=DEFAULT_HISTORY_SIZE)
         self.alarms: deque[AlarmEvent] = deque(maxlen=DEFAULT_HISTORY_SIZE)
@@ -959,8 +1399,62 @@ class AnalyzerSessionController(QObject):
     def initialize_capture(self) -> None:
         self._init_requested.emit()
 
-    def send_payload(self, payload: str, expectation: str = "ack", timeout_ms: int = 1500) -> None:
-        self._payload_requested.emit(payload, expectation, timeout_ms)
+    def send_payload(
+        self,
+        payload: str,
+        expectation: str = "ack",
+        timeout_ms: int = 1500,
+        context: dict[str, object] | None = None,
+    ) -> None:
+        self._payload_requested.emit(payload, expectation, timeout_ms, dict(context or {}))
+
+    def validate_restore_retry_payload(self, payload: str) -> tuple[bool, str]:
+        retry_payload = str(payload or "").strip()
+        if not retry_payload:
+            return False, "未提供恢复主动上传命令。"
+        envelope = YGasProtocol.parse_command(retry_payload)
+        if envelope is None or envelope.code != "SETCOMWAY" or envelope.args[:1] != ["1"]:
+            return False, "恢复主动上传只允许发送有效的 SETCOMWAY=1 命令。"
+        if not self.connected:
+            return False, "当前未连接设备。"
+        if self.current_config.read_only_lock:
+            return False, "只读锁已开启，禁止发送 SETCOMWAY=1。"
+        if self.current_config.session_mode == SESSION_MODE_REPLAY:
+            return False, "回放期间禁止向真实设备发送命令。"
+        if self.current_config.session_mode != SESSION_MODE_ENGINEERING:
+            return False, "当前会话模式不允许发送 SETCOMWAY=1。"
+        if not has_permission(self.current_config.permission_level, "CONFIG"):
+            return False, f"当前权限不足，至少需要 {permission_label('CONFIG')} 权限。"
+        return True, ""
+
+    def validate_stream_start_payload(self, payload: str) -> tuple[bool, str]:
+        stream_payload = str(payload or "").strip()
+        if not stream_payload:
+            return False, "未提供启动实时流命令。"
+        envelope = YGasProtocol.parse_command(stream_payload)
+        if envelope is None or envelope.code != "SETCOMWAY" or envelope.args[:1] != ["1"]:
+            return False, "启动实时流只允许发送有效的 SETCOMWAY=1 命令。"
+        if not self.connected:
+            return False, "当前未连接设备。"
+        if self.current_config.session_mode == SESSION_MODE_REPLAY:
+            return False, "回放期间禁止向真实设备发送命令。"
+        port_name = str(self.current_config.serial.port or "").strip().upper()
+        if not port_name or port_name == "SIMULATOR":
+            return False, "当前未连接真实串口，系统不会启动主动上传。"
+        if self.current_config.read_only_lock:
+            return False, "当前为严格只读，不会自动启动主动上传。"
+        if self.current_config.session_mode == SESSION_MODE_LISTEN_ONLY:
+            return False, "当前为严格只听模式，不会自动启动主动上传。"
+
+        session_target_id = str(self.current_config.target_id or "").strip().upper()
+        payload_target_id = str(envelope.target_id or "").strip().upper()
+        if session_target_id == "FFF" or payload_target_id == "FFF":
+            return False, "为避免影响总线上所有设备，系统不会自动广播启动主动上传，请选择单设备 ID。"
+        if not (session_target_id.isdigit() and len(session_target_id) == 3):
+            return False, f"当前目标设备 ID 无效：{session_target_id or '--'}。请先选择明确三位设备 ID。"
+        if payload_target_id != session_target_id:
+            return False, f"启动实时流仅允许发送到当前目标设备 {session_target_id}。"
+        return True, ""
 
     def export_history(self, output_path: str | None = None) -> str:
         path = export_frames_to_csv(list(self.frames), output_path=output_path)
@@ -988,6 +1482,7 @@ class AnalyzerSessionController(QObject):
 
     @Slot(bool, str)
     def _handle_connection(self, connected: bool, log_path: str) -> None:
+        self.connected = connected
         self.log_path = log_path
         self.connection_changed.emit(connected, log_path)
 

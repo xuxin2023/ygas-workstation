@@ -72,7 +72,7 @@ class CommandEnvelope:
 
 
 class StreamBuffer:
-    """Accumulates byte chunks and emits complete CR/LF-delimited lines."""
+    """Accumulates byte chunks and emits complete protocol records."""
 
     def __init__(self) -> None:
         self._buffer = ""
@@ -89,10 +89,9 @@ class StreamBuffer:
             text = str(chunk)
         if not text:
             return []
-        self._buffer += text.replace("\r\n", "\n").replace("\r", "\n")
-        parts = self._buffer.split("\n")
-        self._buffer = parts.pop() if parts else ""
-        return [part.strip() for part in parts if part.strip()]
+        self._buffer += text
+        records, self._buffer = YGasProtocol._consume_stream_records(self._buffer)
+        return records
 
 
 class YGasProtocol:
@@ -137,7 +136,45 @@ class YGasProtocol:
             text = raw.decode("ascii", errors="ignore")
         else:
             text = str(raw)
-        return [line.strip() for line in text.replace("\r", "\n").split("\n") if line.strip()]
+        records, remainder = YGasProtocol._consume_stream_records(text)
+        if remainder.strip():
+            records.append(remainder.strip())
+        return records
+
+    @staticmethod
+    def _consume_stream_records(text: str) -> tuple[list[str], str]:
+        normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        records: list[str] = []
+        buffer = normalized
+        while buffer:
+            buffer = buffer.lstrip(" \t")
+            if not buffer:
+                break
+            newline_index = buffer.find("\n")
+            wrapped_end = -1
+            if buffer.startswith("<"):
+                wrapped_end = buffer.find(">")
+            if wrapped_end >= 0 and (newline_index < 0 or wrapped_end < newline_index):
+                candidate = buffer[: wrapped_end + 1].strip()
+                if YGasProtocol._looks_like_wrapped_record(candidate):
+                    records.append(candidate)
+                    buffer = buffer[wrapped_end + 1 :]
+                    continue
+            if newline_index < 0:
+                break
+            candidate = buffer[:newline_index].strip()
+            if candidate:
+                records.append(candidate)
+            buffer = buffer[newline_index + 1 :]
+        return records, buffer
+
+    @staticmethod
+    def _looks_like_wrapped_record(text: str) -> bool:
+        candidate = str(text or "").strip()
+        if len(candidate) < 3 or not candidate.startswith("<") or not candidate.endswith(">"):
+            return False
+        inner = candidate[1:-1].strip().upper()
+        return inner.startswith("YGAS,") or inner.startswith("C")
 
     @staticmethod
     def is_ack(line: str) -> bool:
@@ -233,6 +270,24 @@ class YGasProtocol:
         if frame is not None:
             return frame.device_id
         return None
+
+    @staticmethod
+    def classify_line(line: str, *, parse_mode: str = PARSE_MODE_AUTO) -> str:
+        if YGasProtocol.parse_ack(line) is not None:
+            return "ack"
+        if YGasProtocol.parse_coefficient_reply(line) is not None:
+            return "coefficient"
+        if YGasProtocol.parse_identity_reply(line) is not None:
+            return "identity"
+        if YGasProtocol.parse_mode_value_reply(line) is not None:
+            return "mode_value"
+        if YGasProtocol.parse_serial_config_reply(line) is not None:
+            return "serial_config"
+        if YGasProtocol.parse_setting_value_reply(line) is not None:
+            return "setting_value"
+        if YGasProtocol.parse_line(line, parse_mode=parse_mode) is not None:
+            return "telemetry"
+        return ""
 
     @staticmethod
     def parse_line(line: str, *, parse_mode: str = PARSE_MODE_AUTO) -> ParsedFrame | None:
